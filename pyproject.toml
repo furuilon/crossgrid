@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crossgrid"
+version = "0.1.0"
+description = "A conservative coverage map for Python cross-OS support and CI"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Hidden Gems contributors" }]
+dependencies = ["PyYAML>=6.0,<7"]
+
+[project.scripts]
+crossgrid = "crossgrid.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
