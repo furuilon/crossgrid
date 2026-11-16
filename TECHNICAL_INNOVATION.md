@@ -34,7 +34,7 @@ The advance is primarily integration and traceability: each signal is intentiona
 
 ## Performance
 
-Scanning is one directory walk plus per-file AST parsing; workflow and metadata parsing scale with their input sizes. A timing against the project's own small source tree is recorded in `../../docs/PERFORMANCE_REPORT.md`; this is not a large-monorepo benchmark.
+Scanning is one directory walk plus per-file AST parsing; workflow and metadata parsing scale with their input sizes. A timing against the project's own small source tree was recorded in the Hidden Gems portfolio benchmark notes; this is not a large-monorepo benchmark, and the portfolio-only record is not included in this standalone project.
 
 ## Limitations and next technical work
 
