@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import ast
+import heapq
+import io
 import itertools
 import os
 import re
 import shlex
+import tempfile
 import tokenize
 import tomllib
 from dataclasses import asdict, dataclass
@@ -14,15 +17,84 @@ from typing import Any
 import yaml
 
 
-SKIP_DIRS = {".git", ".hg", ".svn", ".venv", "venv", "env", "node_modules", "__pycache__", "build", "dist", ".tox", ".nox"}
+SKIP_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "venv",
+    "env",
+    "node_modules",
+    "__pycache__",
+    "build",
+    "dist",
+    ".tox",
+    ".nox",
+}
 PLATFORM_MODULES = {"pwd", "grp", "fcntl", "termios", "resource", "pty", "winreg"}
 PLATFORM_APIS = {
-    "os.uname", "os.getuid", "os.geteuid", "os.getgid", "os.getegid", "os.getgroups",
-    "os.getpgid", "os.setsid", "os.fork", "os.forkpty", "os.killpg", "os.pathconf",
+    "os.uname",
+    "os.getuid",
+    "os.geteuid",
+    "os.getgid",
+    "os.getegid",
+    "os.getgroups",
+    "os.getpgid",
+    "os.setsid",
+    "os.fork",
+    "os.forkpty",
+    "os.killpg",
+    "os.pathconf",
 }
 PLATFORM_CONSTANTS = {"signal.SIGKILL", "signal.SIGHUP", "signal.SIGTSTP"}
-OS_GUARD_MARKERS = ("sys.platform", "os.name", "platform.system", "platform.machine", "win32", "windows", "linux", "darwin", "posix")
-SKIP_MARKERS = ("sys.platform", "os.name", "win32", "windows", "linux", "darwin", "posix")
+OS_GUARD_MARKERS = (
+    "sys.platform",
+    "os.name",
+    "platform.system",
+    "platform.machine",
+    "win32",
+    "windows",
+    "linux",
+    "darwin",
+    "posix",
+)
+SKIP_MARKERS = (
+    "sys.platform",
+    "os.name",
+    "win32",
+    "windows",
+    "linux",
+    "darwin",
+    "posix",
+)
+MAX_METADATA_BYTES = 1024 * 1024
+MAX_WORKFLOW_BYTES = 2 * 1024 * 1024
+MAX_WORKFLOW_FILES = 1_000
+MAX_TOTAL_WORKFLOW_BYTES = 32 * 1024 * 1024
+MAX_GIT_MARKER_BYTES = 4 * 1024
+MAX_PYTHON_SOURCE_BYTES = 8 * 1024 * 1024
+MAX_PYTHON_FILES = 20_000
+MAX_TOTAL_SOURCE_BYTES = 128 * 1024 * 1024
+
+
+class _InputTooLarge(Exception):
+    """Raised when a source file exceeds its bounded scan size."""
+
+
+def _read_limited_bytes(path: Path, limit: int) -> bytes:
+    with path.open("rb") as stream:
+        contents = stream.read(limit + 1)
+    if len(contents) > limit:
+        raise _InputTooLarge
+    return contents
+
+
+def _read_git_marker(path: Path) -> str:
+    with path.open("rb") as stream:
+        contents = stream.read(MAX_GIT_MARKER_BYTES + 1)
+    if len(contents) > MAX_GIT_MARKER_BYTES:
+        raise ValueError("Git metadata marker exceeds the safe size limit.")
+    return contents.decode("utf-8").strip()
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +128,135 @@ def _safe_project_path(root: Path, path: Path) -> bool:
     return True
 
 
+def _git_metadata_roots(root: Path) -> set[Path]:
+    """Find Git administrative directories for the selected worktree."""
+    metadata_roots: set[Path] = set()
+    for ancestor in (root, *root.parents):
+        marker = ancestor / ".git"
+        try:
+            if marker.is_dir():
+                metadata_roots.add(marker.resolve(strict=True))
+                break
+            if marker.is_file():
+                contents = _read_git_marker(marker)
+                match = re.fullmatch(r"gitdir:\s*(.+)", contents, re.IGNORECASE)
+                if match is None:
+                    raise ValueError("Could not safely parse the project's .git file.")
+                git_dir = Path(match.group(1))
+                if not git_dir.is_absolute():
+                    git_dir = ancestor / git_dir
+                git_dir = git_dir.resolve(strict=True)
+                metadata_roots.add(git_dir)
+                common_dir_file = git_dir / "commondir"
+                if common_dir_file.is_file():
+                    common_dir = Path(_read_git_marker(common_dir_file))
+                    if not common_dir.is_absolute():
+                        common_dir = git_dir / common_dir
+                    metadata_roots.add(common_dir.resolve(strict=True))
+                break
+        except (OSError, RuntimeError, UnicodeError) as exc:
+            raise ValueError(
+                "Could not safely resolve the project's Git metadata."
+            ) from exc
+
+    if all((root / name).exists() for name in ("HEAD", "config", "objects", "refs")):
+        try:
+            metadata_roots.add(root.resolve(strict=True))
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(
+                "Could not safely resolve the project's Git metadata."
+            ) from exc
+    return metadata_roots
+
+
+def _same_path(first: Path, second: Path) -> bool:
+    try:
+        if first.resolve(strict=False) == second.resolve(strict=False):
+            return True
+        if first.exists() and second.exists():
+            return os.path.samefile(first, second)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("A report output path could not be checked safely.") from exc
+    return False
+
+
+def _validate_report_targets(
+    root: Path, outputs: list[str | None], input_paths: list[Path]
+) -> list[Path]:
+    destinations = [Path(output).expanduser() for output in outputs if output]
+    metadata_roots = _git_metadata_roots(root)
+    for index, destination in enumerate(destinations):
+        destination = Path(os.path.abspath(destination))
+        destinations[index] = destination
+        try:
+            resolved = destination.resolve(strict=False)
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(
+                "A report output path could not be resolved safely."
+            ) from exc
+        for ancestor in (destination, *destination.parents):
+            if ancestor.is_symlink():
+                raise ValueError(
+                    f"Report output cannot traverse a symbolic link: {ancestor}"
+                )
+        if destination.exists() and destination.is_dir():
+            raise ValueError(f"Report output path is a directory: {destination}")
+        if any(
+            resolved == git_dir or resolved.is_relative_to(git_dir)
+            for git_dir in metadata_roots
+        ):
+            raise ValueError("Report output cannot be inside Git metadata.")
+        if any(part.casefold() == ".git" for part in resolved.parts):
+            raise ValueError("Report output cannot be inside Git metadata.")
+        try:
+            relative = resolved.relative_to(root)
+        except ValueError:
+            relative = None
+        if relative is not None and (
+            relative.suffix == ".py"
+            or relative.name.casefold() == "pyproject.toml"
+            or (
+                len(relative.parts) >= 3
+                and tuple(part.casefold() for part in relative.parts[:2])
+                == (".github", "workflows")
+                and relative.suffix.lower() in {".yml", ".yaml"}
+            )
+        ):
+            raise ValueError(
+                f"Report output cannot overwrite a scan input: {destination}"
+            )
+        if any(_same_path(resolved, source) for source in input_paths):
+            raise ValueError(
+                f"Report output cannot overwrite a scan input: {destination}"
+            )
+
+    for index, destination in enumerate(destinations):
+        if any(_same_path(destination, other) for other in destinations[index + 1 :]):
+            raise ValueError("Report output paths must be distinct.")
+    return destinations
+
+
+def _write_report(path: Path, content: str) -> None:
+    temporary_name: str | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(content)
+            stream.flush()
+        os.replace(temporary_name, path)
+    except OSError as exc:
+        raise ValueError(f"Could not write report output file: {path}") from exc
+    finally:
+        if temporary_name is not None:
+            try:
+                Path(temporary_name).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def _platforms_from_runner(value: Any) -> set[str]:
     text = str(value).lower()
     result: set[str] = set()
@@ -76,38 +277,116 @@ def _platforms_from_classifiers(classifiers: list[str]) -> set[str]:
             result.add("windows")
         if "posix :: linux" in value or "operating system :: linux" in value:
             result.add("linux")
-        if "operating system :: macos" in value or "operating system :: mac os" in value:
+        if (
+            "operating system :: macos" in value
+            or "operating system :: mac os" in value
+        ):
             result.add("macos")
     return result
 
 
-def _read_project_platforms(root: Path) -> tuple[set[str], list[Finding]]:
+def _read_project_platforms(
+    root: Path, input_paths: list[Path] | None = None
+) -> tuple[set[str], list[Finding]]:
     path = root / "pyproject.toml"
+    if input_paths is not None and (path.exists() or path.is_symlink()):
+        input_paths.append(path)
     if not path.exists():
         return set(), []
     if not _safe_project_path(root, path):
-        return set(), [Finding("CG902", "warning", "high", "pyproject.toml", 1, 1, "metadata path", "Project metadata symlink or path escape was skipped.", "CrossGrid reads only non-symlink files inside the selected project root.")]
+        return set(), [
+            Finding(
+                "CG902",
+                "warning",
+                "high",
+                "pyproject.toml",
+                1,
+                1,
+                "metadata path",
+                "Project metadata symlink or path escape was skipped.",
+                "CrossGrid reads only non-symlink files inside the selected project root.",
+            )
+        ]
     try:
-        metadata = tomllib.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
-        return set(), [Finding("CG902", "warning", "high", "pyproject.toml", 1, 1, "metadata", f"Could not read project classifiers: {exc.__class__.__name__}.", "TOML metadata could not be parsed.")]
+        metadata = tomllib.loads(
+            _read_limited_bytes(path, MAX_METADATA_BYTES).decode("utf-8")
+        )
+    except (
+        OSError,
+        UnicodeError,
+        tomllib.TOMLDecodeError,
+        RecursionError,
+        _InputTooLarge,
+    ) as exc:
+        return set(), [
+            Finding(
+                "CG902",
+                "warning",
+                "high",
+                "pyproject.toml",
+                1,
+                1,
+                "metadata",
+                f"Could not read project classifiers: {exc.__class__.__name__}.",
+                "TOML metadata could not be parsed.",
+            )
+        ]
     project = metadata.get("project", {})
     tool = metadata.get("tool", {})
     if not isinstance(project, dict) or not isinstance(tool, dict):
-        return set(), [Finding("CG902", "warning", "high", "pyproject.toml", 1, 1, "metadata shape", "Project metadata tables have an invalid shape.", "Expected [project] and [tool] values to be TOML tables.")]
+        return set(), [
+            Finding(
+                "CG902",
+                "warning",
+                "high",
+                "pyproject.toml",
+                1,
+                1,
+                "metadata shape",
+                "Project metadata tables have an invalid shape.",
+                "Expected [project] and [tool] values to be TOML tables.",
+            )
+        ]
     poetry = tool.get("poetry", {})
     if not isinstance(poetry, dict):
-        return set(), [Finding("CG902", "warning", "high", "pyproject.toml", 1, 1, "metadata shape", "Poetry metadata has an invalid shape.", "Expected [tool.poetry] to be a TOML table.")]
+        return set(), [
+            Finding(
+                "CG902",
+                "warning",
+                "high",
+                "pyproject.toml",
+                1,
+                1,
+                "metadata shape",
+                "Poetry metadata has an invalid shape.",
+                "Expected [tool.poetry] to be a TOML table.",
+            )
+        ]
     classifiers = project.get("classifiers", []) or poetry.get("classifiers", [])
     if not isinstance(classifiers, list):
-        return set(), [Finding("CG902", "warning", "high", "pyproject.toml", 1, 1, "classifiers", "Project classifiers must be a TOML array.", "Classifiers could not be used to infer declared platform scope.")]
+        return set(), [
+            Finding(
+                "CG902",
+                "warning",
+                "high",
+                "pyproject.toml",
+                1,
+                1,
+                "classifiers",
+                "Project classifiers must be a TOML array.",
+                "Classifiers could not be used to infer declared platform scope.",
+            )
+        ]
     return _platforms_from_classifiers([str(value) for value in classifiers]), []
 
 
 def _command_invokes_test_tool(command: str) -> bool:
     assignment = r"(?:[A-Za-z_][A-Za-z0-9_]*=(?:\"[^\"]*\"|'[^']*'|[^\s]+)\s+)*"
     invocation = re.compile(
-        r"^(?:env\s+)?" + assignment + r"(?:env\s+)?" + assignment
+        r"^(?:env\s+)?"
+        + assignment
+        + r"(?:env\s+)?"
+        + assignment
         + r"(?:(?:uv\s+run|poetry\s+run|pipenv\s+run)(?:\s+--[^\s]+)*\s+)*"
         + r"(?:(?:coverage|coverage3)\s+run(?:\s+-m)?\s+)?"
         + r"(?:(?:python(?:\d+(?:\.\d+)*)?|py(?:\s+-\d+(?:\.\d+)*)?)\s+-m\s+(?P<module>pytest|unittest)|(?P<tool>pytest|tox|nox))"
@@ -124,7 +403,9 @@ def _command_invokes_test_tool(command: str) -> bool:
                 continue
             test_tool = (match.group("module") or match.group("tool")).lower()
             if test_tool in {"tox", "nox"}:
-                if test_tool == "tox" and _tox_has_non_run_subcommand(match.group("args")):
+                if test_tool == "tox" and _tox_has_non_run_subcommand(
+                    match.group("args")
+                ):
                     continue
                 selector_values = re.findall(
                     r"(?<!\S)(?:-e|--env|--envlist|-s|--session|--sessions)(?:=|\s+)([A-Za-z0-9_.-]+)",
@@ -132,19 +413,49 @@ def _command_invokes_test_tool(command: str) -> bool:
                     re.IGNORECASE,
                 )
                 selected_test_environment = any(
-                    re.search(r"(?<![a-z0-9])(?:test|tests|unit|unittest|pytest)(?![a-z0-9])", name, re.IGNORECASE)
+                    re.search(
+                        r"(?<![a-z0-9])(?:test|tests|unit|unittest|pytest)(?![a-z0-9])",
+                        name,
+                        re.IGNORECASE,
+                    )
                     for value in selector_values
                     for name in value.split(",")
                 )
                 if not selected_test_environment:
                     continue
-            options = re.findall(r"(?<!\S)(--[A-Za-z][A-Za-z-]*(?:=[^\s]+)?|-[A-Za-z]+)(?=\s|$)", match.group("args"))
-            long_options = {option.split("=", 1)[0].lower() for option in options if option.startswith("--")}
-            short_options = {option for option in options if not option.startswith("--")}
+            options = re.findall(
+                r"(?<!\S)(--[A-Za-z][A-Za-z-]*(?:=[^\s]+)?|-[A-Za-z]+)(?=\s|$)",
+                match.group("args"),
+            )
+            long_options = {
+                option.split("=", 1)[0].lower()
+                for option in options
+                if option.startswith("--")
+            }
+            short_options = {
+                option for option in options if not option.startswith("--")
+            }
             non_execution_long = {
-                "pytest": {"--help", "--version", "--collect-only", "--co", "--fixtures", "--fixtures-per-test", "--markers"},
+                "pytest": {
+                    "--help",
+                    "--version",
+                    "--collect-only",
+                    "--co",
+                    "--fixtures",
+                    "--fixtures-per-test",
+                    "--markers",
+                },
                 "unittest": {"--help"},
-                "tox": {"--help", "--version", "--listenvs", "--listenvs-all", "--notest", "--pkg-only", "--sdistonly", "--devenv"},
+                "tox": {
+                    "--help",
+                    "--version",
+                    "--listenvs",
+                    "--listenvs-all",
+                    "--notest",
+                    "--pkg-only",
+                    "--sdistonly",
+                    "--devenv",
+                },
                 "nox": {"--help", "--version", "--list", "--list-sessions"},
             }
             non_execution_short = {
@@ -167,14 +478,45 @@ def _tox_has_non_run_subcommand(arguments: str) -> bool:
     except ValueError:
         return True
     value_options = {
-        "-e", "--env", "--envlist", "-m", "--label", "-f", "--factor", "--skip-env",
-        "-c", "--conf", "--workdir", "--root", "--runner", "-x", "--override",
-        "--result-json", "--hashseed", "--discover", "--format", "-o",
+        "-e",
+        "--env",
+        "--envlist",
+        "-m",
+        "--label",
+        "-f",
+        "--factor",
+        "--skip-env",
+        "-c",
+        "--conf",
+        "--workdir",
+        "--root",
+        "--runner",
+        "-x",
+        "--override",
+        "--result-json",
+        "--hashseed",
+        "--discover",
+        "--format",
+        "-o",
     }
     run_commands = {"run", "r", "run-parallel", "p"}
     known_commands = run_commands | {
-        "depends", "de", "man", "list", "l", "devenv", "d", "schema", "config", "c",
-        "quickstart", "q", "exec", "e", "legacy", "le",
+        "depends",
+        "de",
+        "man",
+        "list",
+        "l",
+        "devenv",
+        "d",
+        "schema",
+        "config",
+        "c",
+        "quickstart",
+        "q",
+        "exec",
+        "e",
+        "legacy",
+        "le",
     }
     index = 0
     while index < len(tokens):
@@ -200,7 +542,9 @@ def _is_test_job(name: str, job: dict) -> bool:
             commands.append(str(step.get("run", "")))
     test_label = re.compile(r"(?<![a-z0-9])test(?:s|ing)?(?![a-z0-9])", re.IGNORECASE)
     normalized_labels = [re.sub(r"[_-]+", " ", label) for label in label_parts]
-    return any(test_label.search(label) for label in normalized_labels) or any(_command_invokes_test_tool(command) for command in commands)
+    return any(test_label.search(label) for label in normalized_labels) or any(
+        _command_invokes_test_tool(command) for command in commands
+    )
 
 
 def _runner_values(value: Any) -> list[str]:
@@ -212,7 +556,10 @@ def _runner_values(value: Any) -> list[str]:
 
 
 def _runs_on_uses_matrix_os(value: Any) -> bool:
-    pattern = re.compile(r"^\s*\$\{\{\s*matrix\s*(?:\.\s*os\b|\[\s*['\"]os['\"]\s*\])\s*\}\}\s*$", re.IGNORECASE)
+    pattern = re.compile(
+        r"^\s*\$\{\{\s*matrix\s*(?:\.\s*os\b|\[\s*['\"]os['\"]\s*\])\s*\}\}\s*$",
+        re.IGNORECASE,
+    )
     return any(pattern.search(item) for item in _runner_values(value))
 
 
@@ -223,7 +570,9 @@ def _matrix_os_values(matrix: Any) -> list[str]:
     for key, values in matrix.items():
         if key in {"include", "exclude"}:
             continue
-        if not isinstance(values, list) or any(not isinstance(value, (str, int, float, bool)) for value in values):
+        if not isinstance(values, list) or any(
+            not isinstance(value, (str, int, float, bool)) for value in values
+        ):
             return []
         dimensions[str(key)] = values
 
@@ -233,30 +582,48 @@ def _matrix_os_values(matrix: Any) -> list[str]:
         if combinations_count > 256:
             return []
     keys = list(dimensions)
-    combinations = [dict(zip(keys, values)) for values in itertools.product(*(dimensions[key] for key in keys))] if keys else [{}]
+    combinations = (
+        [
+            dict(zip(keys, values))
+            for values in itertools.product(*(dimensions[key] for key in keys))
+        ]
+        if keys
+        else [{}]
+    )
     exclusions = matrix.get("exclude", [])
     if isinstance(exclusions, list):
         combinations = [
-            combination for combination in combinations
+            combination
+            for combination in combinations
             if not any(
                 isinstance(exclusion, dict)
                 and exclusion
-                and all(key in combination and combination[key] == value for key, value in exclusion.items())
+                and all(
+                    key in combination and combination[key] == value
+                    for key, value in exclusion.items()
+                )
                 for exclusion in exclusions
             )
         ]
-    values = [str(combination["os"]) for combination in combinations if isinstance(combination.get("os"), (str, int, float, bool))]
+    values = [
+        str(combination["os"])
+        for combination in combinations
+        if isinstance(combination.get("os"), (str, int, float, bool))
+    ]
     includes = matrix.get("include", [])
     if isinstance(includes, list):
         values.extend(
             str(entry["os"])
             for entry in includes
-            if isinstance(entry, dict) and isinstance(entry.get("os"), (str, int, float, bool))
+            if isinstance(entry, dict)
+            and isinstance(entry.get("os"), (str, int, float, bool))
         )
     return values
 
 
-def _scan_workflows(root: Path) -> tuple[list[dict], set[str], list[Finding]]:
+def _scan_workflows(
+    root: Path, input_paths: list[Path] | None = None
+) -> tuple[list[dict], set[str], list[Finding]]:
     workflow_dir = root / ".github" / "workflows"
     if not workflow_dir.is_dir():
         return [], set(), []
@@ -264,16 +631,122 @@ def _scan_workflows(root: Path) -> tuple[list[dict], set[str], list[Finding]]:
     findings: list[Finding] = []
     all_test_platforms: set[str] = set()
     if not _safe_project_path(root, workflow_dir):
-        return [], set(), [Finding("CG903", "warning", "high", ".github/workflows", 1, 1, "workflow path", "Workflow directory symlink or path escape was skipped.", "CrossGrid reads only non-symlink paths inside the selected project root.")]
-    for path in sorted([*workflow_dir.glob("*.yml"), *workflow_dir.glob("*.yaml")]):
+        return (
+            [],
+            set(),
+            [
+                Finding(
+                    "CG903",
+                    "warning",
+                    "high",
+                    ".github/workflows",
+                    1,
+                    1,
+                    "workflow path",
+                    "Workflow directory symlink or path escape was skipped.",
+                    "CrossGrid reads only non-symlink paths inside the selected project root.",
+                )
+            ],
+        )
+    workflow_paths = heapq.nsmallest(
+        MAX_WORKFLOW_FILES + 1,
+        itertools.chain(workflow_dir.glob("*.yml"), workflow_dir.glob("*.yaml")),
+    )
+    if len(workflow_paths) > MAX_WORKFLOW_FILES:
+        findings.append(
+            Finding(
+                "CG903",
+                "warning",
+                "high",
+                ".github/workflows",
+                1,
+                1,
+                "workflow file limit",
+                f"Workflow scan stopped at the {MAX_WORKFLOW_FILES}-file limit.",
+                "The directory contains more GitHub Actions workflows than CrossGrid analyzes in one run.",
+            )
+        )
+        workflow_paths = workflow_paths[:MAX_WORKFLOW_FILES]
+
+    workflow_bytes = 0
+    for path in workflow_paths:
         relative = path.relative_to(root).as_posix()
+        if input_paths is not None:
+            input_paths.append(path)
         if not _safe_project_path(root, path):
-            findings.append(Finding("CG903", "warning", "high", relative, 1, 1, "workflow path", "Workflow symlink or path escape was skipped.", "CrossGrid reads only non-symlink files inside the selected project root."))
+            findings.append(
+                Finding(
+                    "CG903",
+                    "warning",
+                    "high",
+                    relative,
+                    1,
+                    1,
+                    "workflow path",
+                    "Workflow symlink or path escape was skipped.",
+                    "CrossGrid reads only non-symlink files inside the selected project root.",
+                )
+            )
             continue
         try:
-            data = yaml.safe_load(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, yaml.YAMLError) as exc:
-            findings.append(Finding("CG903", "warning", "high", relative, 1, 1, "workflow", f"Could not parse workflow YAML ({exc.__class__.__name__}).", "The workflow was not included in runner coverage."))
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        if size > MAX_WORKFLOW_BYTES:
+            findings.append(
+                Finding(
+                    "CG903",
+                    "warning",
+                    "high",
+                    relative,
+                    1,
+                    1,
+                    "workflow size limit",
+                    f"Workflow exceeds the {MAX_WORKFLOW_BYTES}-byte per-file limit.",
+                    "This workflow was not read or analyzed.",
+                )
+            )
+            continue
+        if workflow_bytes + size > MAX_TOTAL_WORKFLOW_BYTES:
+            findings.append(
+                Finding(
+                    "CG903",
+                    "warning",
+                    "high",
+                    relative,
+                    1,
+                    1,
+                    "total workflow size limit",
+                    f"Workflow scan stopped at the {MAX_TOTAL_WORKFLOW_BYTES}-byte total input limit.",
+                    "Remaining workflow files were not read or analyzed.",
+                )
+            )
+            break
+        workflow_bytes += size
+        try:
+            data = yaml.safe_load(
+                _read_limited_bytes(path, MAX_WORKFLOW_BYTES).decode("utf-8")
+            )
+        except (
+            OSError,
+            UnicodeError,
+            yaml.YAMLError,
+            RecursionError,
+            _InputTooLarge,
+        ) as exc:
+            findings.append(
+                Finding(
+                    "CG903",
+                    "warning",
+                    "high",
+                    relative,
+                    1,
+                    1,
+                    "workflow",
+                    f"Could not parse workflow YAML ({exc.__class__.__name__}).",
+                    "The workflow was not included in runner coverage.",
+                )
+            )
             continue
         if not isinstance(data, dict) or not isinstance(data.get("jobs"), dict):
             continue
@@ -287,10 +760,16 @@ def _scan_workflows(root: Path) -> tuple[list[dict], set[str], list[Finding]]:
             if _runs_on_uses_matrix_os(runs_on):
                 raw_values = _matrix_os_values(matrix)
             else:
-                raw_values = [value for value in _runner_values(runs_on) if "${{" not in value]
+                raw_values = [
+                    value for value in _runner_values(runs_on) if "${{" not in value
+                ]
             # Matrix OS labels count only when runs-on actually depends on matrix.os.
             unique = sorted(set(raw_values))
-            platforms = sorted(set().union(*(_platforms_from_runner(value) for value in unique)) if unique else set())
+            platforms = sorted(
+                set().union(*(_platforms_from_runner(value) for value in unique))
+                if unique
+                else set()
+            )
             if not unique:
                 continue
             runner = {
@@ -311,7 +790,10 @@ def _skip_platforms(text: str) -> set[str]:
     if not any(marker in lowered for marker in SKIP_MARKERS):
         return set()
     result: set[str] = set()
-    if any(token in lowered for token in ("win32", "windows", "os.name == 'nt'", 'os.name == "nt"')):
+    if any(
+        token in lowered
+        for token in ("win32", "windows", "os.name == 'nt'", 'os.name == "nt"')
+    ):
         result.add("windows")
     if any(token in lowered for token in ("linux", "ubuntu")):
         result.add("linux")
@@ -333,7 +815,11 @@ def _ast_column(source: str, node: ast.AST) -> int:
     lines = source.splitlines()
     if not 1 <= line_number <= len(lines):
         return byte_column + 1
-    prefix = lines[line_number - 1].encode("utf-8")[:byte_column].decode("utf-8", errors="ignore")
+    prefix = (
+        lines[line_number - 1]
+        .encode("utf-8")[:byte_column]
+        .decode("utf-8", errors="ignore")
+    )
     return len(prefix) + 1
 
 
@@ -360,14 +846,18 @@ def _alias_maps(tree: ast.Module) -> tuple[dict[str, str], dict[str, str]]:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 local = alias.asname or alias.name.split(".")[0]
-                modules[local] = alias.name if alias.asname else alias.name.split(".")[0]
+                modules[local] = (
+                    alias.name if alias.asname else alias.name.split(".")[0]
+                )
         elif isinstance(node, ast.ImportFrom) and node.module:
             for alias in node.names:
                 names[alias.asname or alias.name] = f"{node.module}.{alias.name}"
     return modules, names
 
 
-def _canonical_name(node: ast.AST, modules: dict[str, str], names: dict[str, str]) -> str:
+def _canonical_name(
+    node: ast.AST, modules: dict[str, str], names: dict[str, str]
+) -> str:
     if isinstance(node, ast.Name):
         return names.get(node.id, modules.get(node.id, node.id))
     if isinstance(node, ast.Attribute):
@@ -376,7 +866,12 @@ def _canonical_name(node: ast.AST, modules: dict[str, str], names: dict[str, str
     return ""
 
 
-def _open_api_name(node: ast.Call, modules: dict[str, str], names: dict[str, str], path_instances: set[str]) -> str | None:
+def _open_api_name(
+    node: ast.Call,
+    modules: dict[str, str],
+    names: dict[str, str],
+    path_instances: set[str],
+) -> str | None:
     called = _canonical_name(node.func, modules, names)
     if called == "open" and isinstance(node.func, ast.Name):
         return "open"
@@ -384,17 +879,27 @@ def _open_api_name(node: ast.Call, modules: dict[str, str], names: dict[str, str
     if called in known:
         return called
     # Handle Path("file").open(...) while leaving arbitrary archive and third-party .open() calls alone.
-    if isinstance(node.func, ast.Attribute) and node.func.attr == "open" and isinstance(node.func.value, ast.Call):
+    if (
+        isinstance(node.func, ast.Attribute)
+        and node.func.attr == "open"
+        and isinstance(node.func.value, ast.Call)
+    ):
         constructor = _canonical_name(node.func.value.func, modules, names)
         if constructor in {"pathlib.Path", "pathlib.PurePath"}:
             return f"{constructor}.open"
-    if isinstance(node.func, ast.Attribute) and node.func.attr == "open" and isinstance(node.func.value, ast.Name):
+    if (
+        isinstance(node.func, ast.Attribute)
+        and node.func.attr == "open"
+        and isinstance(node.func.value, ast.Name)
+    ):
         if node.func.value.id in path_instances:
             return "pathlib.Path.open"
     return None
 
 
-def _path_instance_names(tree: ast.Module, modules: dict[str, str], names: dict[str, str]) -> set[str]:
+def _path_instance_names(
+    tree: ast.Module, modules: dict[str, str], names: dict[str, str]
+) -> set[str]:
     """Conservatively track names whose every visible binding is a direct Path construction."""
     bindings: dict[str, list[bool]] = {}
 
@@ -442,14 +947,20 @@ def _path_instance_names(tree: ast.Module, modules: dict[str, str], names: dict[
                 bindings.setdefault(node.rest, []).append(False)
             elif isinstance(node, ast.Import):
                 for alias in node.names:
-                    bindings.setdefault(alias.asname or alias.name.split(".")[0], []).append(False)
+                    bindings.setdefault(
+                        alias.asname or alias.name.split(".")[0], []
+                    ).append(False)
             elif isinstance(node, ast.ImportFrom):
                 for alias in node.names:
                     bindings.setdefault(alias.asname or alias.name, []).append(False)
             elif isinstance(node, ast.Delete):
                 bind(ast.Tuple(elts=node.targets, ctx=ast.Load()), False)
             continue
-        constructor = _canonical_name(value.func, modules, names) if isinstance(value, ast.Call) else ""
+        constructor = (
+            _canonical_name(value.func, modules, names)
+            if isinstance(value, ast.Call)
+            else ""
+        )
         is_path = constructor in {"pathlib.Path", "pathlib.PurePath"}
         for target in targets:
             bind(target, is_path)
@@ -476,14 +987,53 @@ def _module_imports(node: ast.AST) -> list[str]:
 def _scan_python(path: Path, root: Path) -> tuple[list[Finding], list[dict]]:
     relative = path.relative_to(root).as_posix()
     try:
-        with tokenize.open(path) as stream:
-            source = stream.read()
-    except (OSError, UnicodeError, SyntaxError) as exc:
-        return [Finding("CG904", "warning", "high", relative, 1, 1, "source", f"Could not read Python source ({exc.__class__.__name__}).", "Source file was not analyzed.")], []
+        encoded = _read_limited_bytes(path, MAX_PYTHON_SOURCE_BYTES)
+        encoding, _ = tokenize.detect_encoding(io.BytesIO(encoded).readline)
+        source = encoded.decode(encoding)
+    except (OSError, UnicodeError, SyntaxError, _InputTooLarge) as exc:
+        return [
+            Finding(
+                "CG904",
+                "warning",
+                "high",
+                relative,
+                1,
+                1,
+                "source",
+                f"Could not read Python source ({exc.__class__.__name__}).",
+                "Source file was not analyzed.",
+            )
+        ], []
     try:
         tree = ast.parse(source, filename=relative)
+    except RecursionError:
+        return [
+            Finding(
+                "CG905",
+                "warning",
+                "high",
+                relative,
+                1,
+                1,
+                "source",
+                "Python syntax exceeded the parser's nesting limit.",
+                "This file was not included in source risk analysis.",
+            )
+        ], []
     except SyntaxError as exc:
-        return [Finding("CG905", "warning", "high", relative, exc.lineno or 1, exc.offset or 1, "source", "Python syntax could not be parsed.", "This file was not included in source risk analysis.")], []
+        return [
+            Finding(
+                "CG905",
+                "warning",
+                "high",
+                relative,
+                exc.lineno or 1,
+                exc.offset or 1,
+                "source",
+                "Python syntax could not be parsed.",
+                "This file was not included in source risk analysis.",
+            )
+        ], []
 
     modules, names = _alias_maps(tree)
     path_instances = _path_instance_names(tree, modules, names)
@@ -494,69 +1044,152 @@ def _scan_python(path: Path, root: Path) -> tuple[list[Finding], list[dict]]:
             for module in _module_imports(node):
                 if module in PLATFORM_MODULES:
                     guarded = _is_os_guard(ancestors, source, node)
-                    findings.append(Finding(
-                        "CG101", "warning", "high" if not guarded else "review", relative, node.lineno, _ast_column(source, node),
-                        module, "Platform-specific module import; review its availability and fallback on declared target OSes.",
-                        "Import appears inside an ImportError guard." if guarded else "No nearby platform guard or import fallback was identified.",
-                    ))
+                    findings.append(
+                        Finding(
+                            "CG101",
+                            "warning",
+                            "high" if not guarded else "review",
+                            relative,
+                            node.lineno,
+                            _ast_column(source, node),
+                            module,
+                            "Platform-specific module import; review its availability and fallback on declared target OSes.",
+                            "Import appears inside an ImportError guard."
+                            if guarded
+                            else "No nearby platform guard or import fallback was identified.",
+                        )
+                    )
         elif isinstance(node, ast.Call):
             called = _canonical_name(node.func, modules, names)
             if called in PLATFORM_APIS:
                 guarded = _is_os_guard(ancestors, source, node)
-                findings.append(Finding(
-                    "CG102", "warning", "high" if not guarded else "review", relative, node.lineno, _ast_column(source, node),
-                    called, "Platform-specific API call; confirm it is available or guarded on every declared OS.",
-                    "An OS-related if guard was found in an ancestor." if guarded else "No OS-related ancestor guard was identified.",
-                ))
+                findings.append(
+                    Finding(
+                        "CG102",
+                        "warning",
+                        "high" if not guarded else "review",
+                        relative,
+                        node.lineno,
+                        _ast_column(source, node),
+                        called,
+                        "Platform-specific API call; confirm it is available or guarded on every declared OS.",
+                        "An OS-related if guard was found in an ancestor."
+                        if guarded
+                        else "No OS-related ancestor guard was identified.",
+                    )
+                )
             open_api = _open_api_name(node, modules, names, path_instances)
             if open_api:
                 mode = None
                 path_api = open_api in {"pathlib.Path.open", "pathlib.PurePath.open"}
-                receiver = node.func.value if isinstance(node.func, ast.Attribute) else None
-                unbound_path_call = path_api and isinstance(receiver, (ast.Name, ast.Attribute)) and _canonical_name(receiver, modules, names) in {"pathlib.Path", "pathlib.PurePath"}
+                receiver = (
+                    node.func.value if isinstance(node.func, ast.Attribute) else None
+                )
+                unbound_path_call = (
+                    path_api
+                    and isinstance(receiver, (ast.Name, ast.Attribute))
+                    and _canonical_name(receiver, modules, names)
+                    in {"pathlib.Path", "pathlib.PurePath"}
+                )
                 mode_index = 1 if unbound_path_call else 0 if path_api else 1
                 encoding_index = 3 if unbound_path_call else 2 if path_api else 3
-                if len(node.args) > mode_index and isinstance(node.args[mode_index], ast.Constant):
+                if len(node.args) > mode_index and isinstance(
+                    node.args[mode_index], ast.Constant
+                ):
                     mode = str(node.args[mode_index].value)
                 if mode is None:
-                    mode_keyword = next((keyword for keyword in node.keywords if keyword.arg == "mode"), None)
+                    mode_keyword = next(
+                        (keyword for keyword in node.keywords if keyword.arg == "mode"),
+                        None,
+                    )
                     if mode_keyword and isinstance(mode_keyword.value, ast.Constant):
                         mode = str(mode_keyword.value.value)
-                encoding = next((keyword for keyword in node.keywords if keyword.arg == "encoding"), None)
+                encoding = next(
+                    (keyword for keyword in node.keywords if keyword.arg == "encoding"),
+                    None,
+                )
                 binary = isinstance(mode, str) and "b" in mode
                 if encoding is not None:
-                    encoding_is_default = isinstance(encoding.value, ast.Constant) and encoding.value.value is None
+                    encoding_is_default = (
+                        isinstance(encoding.value, ast.Constant)
+                        and encoding.value.value is None
+                    )
                 elif len(node.args) > encoding_index:
-                    encoding_is_default = isinstance(node.args[encoding_index], ast.Constant) and node.args[encoding_index].value is None
+                    encoding_is_default = (
+                        isinstance(node.args[encoding_index], ast.Constant)
+                        and node.args[encoding_index].value is None
+                    )
                 else:
                     encoding_is_default = True
                 if encoding_is_default and not binary:
-                    findings.append(Finding(
-                        "CG201", "review", "medium", relative, node.lineno, _ast_column(source, node),
-                        open_api, "Text file open() has no explicit encoding; platform defaults can differ.",
-                        "Recognized built-in, io, and pathlib open APIs; dynamic modes or encodings supplied through **kwargs may be missed.",
-                    ))
-            if called == "os.system" or (called.startswith("subprocess.") and any(key.arg == "shell" and isinstance(key.value, ast.Constant) and key.value.value is True for key in node.keywords)):
-                findings.append(Finding(
-                    "CG301", "review", "medium", relative, node.lineno, _ast_column(source, node), called,
-                    "Shell execution can vary between cmd.exe and POSIX shells; review commands and prefer argument lists where possible.",
-                    "Static analysis cannot determine whether the command is portable.",
-                ))
+                    findings.append(
+                        Finding(
+                            "CG201",
+                            "review",
+                            "medium",
+                            relative,
+                            node.lineno,
+                            _ast_column(source, node),
+                            open_api,
+                            "Text file open() has no explicit encoding; platform defaults can differ.",
+                            "Recognized built-in, io, and pathlib open APIs; dynamic modes or encodings supplied through **kwargs may be missed.",
+                        )
+                    )
+            if called == "os.system" or (
+                called.startswith("subprocess.")
+                and any(
+                    key.arg == "shell"
+                    and isinstance(key.value, ast.Constant)
+                    and key.value.value is True
+                    for key in node.keywords
+                )
+            ):
+                findings.append(
+                    Finding(
+                        "CG301",
+                        "review",
+                        "medium",
+                        relative,
+                        node.lineno,
+                        _ast_column(source, node),
+                        called,
+                        "Shell execution can vary between cmd.exe and POSIX shells; review commands and prefer argument lists where possible.",
+                        "Static analysis cannot determine whether the command is portable.",
+                    )
+                )
             if called.endswith("NamedTemporaryFile"):
-                findings.append(Finding(
-                    "CG202", "review", "low", relative, node.lineno, _ast_column(source, node), called,
-                    "Temporary-file reopen/locking behavior differs across platforms; review tests that reopen this path before close.",
-                    "Potential Windows file-locking risk; no reopen behavior is inferred.",
-                ))
+                findings.append(
+                    Finding(
+                        "CG202",
+                        "review",
+                        "low",
+                        relative,
+                        node.lineno,
+                        _ast_column(source, node),
+                        called,
+                        "Temporary-file reopen/locking behavior differs across platforms; review tests that reopen this path before close.",
+                        "Potential Windows file-locking risk; no reopen behavior is inferred.",
+                    )
+                )
         elif isinstance(node, (ast.Attribute, ast.Name)):
             called = _canonical_name(node, modules, names)
             if called in PLATFORM_CONSTANTS:
                 guarded = _is_os_guard(ancestors, source, node)
-                findings.append(Finding(
-                    "CG102", "warning", "high" if not guarded else "review", relative, node.lineno, _ast_column(source, node),
-                    called, "Platform-specific signal constant; confirm availability or guard it on every declared OS.",
-                    "An OS-related if guard was found in an ancestor." if guarded else "No OS-related ancestor guard was identified.",
-                ))
+                findings.append(
+                    Finding(
+                        "CG102",
+                        "warning",
+                        "high" if not guarded else "review",
+                        relative,
+                        node.lineno,
+                        _ast_column(source, node),
+                        called,
+                        "Platform-specific signal constant; confirm availability or guard it on every declared OS.",
+                        "An OS-related if guard was found in an ancestor."
+                        if guarded
+                        else "No OS-related ancestor guard was identified.",
+                    )
+                )
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             for decorator in node.decorator_list:
                 text = _node_text(decorator, source)
@@ -565,7 +1198,14 @@ def _scan_python(path: Path, root: Path) -> tuple[list[Finding], list[dict]]:
                     if isinstance(decorator, ast.Call) and decorator.args:
                         condition = decorator.args[0]
                     elif isinstance(decorator, ast.Call):
-                        condition = next((keyword.value for keyword in decorator.keywords if keyword.arg == "condition"), decorator)
+                        condition = next(
+                            (
+                                keyword.value
+                                for keyword in decorator.keywords
+                                if keyword.arg == "condition"
+                            ),
+                            decorator,
+                        )
                     else:
                         condition = decorator
                     condition_text = _node_text(condition, source)
@@ -574,22 +1214,47 @@ def _scan_python(path: Path, root: Path) -> tuple[list[Finding], list[dict]]:
                         platforms_set = {"windows", "linux", "macos"} - platforms_set
                     platforms = sorted(platforms_set)
                     if platforms:
-                        skipped.append({"file": relative, "line": decorator.lineno, "subject": getattr(node, "name", "test"), "platforms": platforms, "condition": text[:240]})
-                        findings.append(Finding(
-                            "CG801", "note", "medium", relative, decorator.lineno, _ast_column(source, decorator),
-                            getattr(node, "name", "test"), "Test has an explicit platform-related skip condition.",
-                            f"Detected target platform(s): {', '.join(platforms)}. Condition is shown as source text only.",
-                        ))
+                        skipped.append(
+                            {
+                                "file": relative,
+                                "line": decorator.lineno,
+                                "subject": getattr(node, "name", "test"),
+                                "platforms": platforms,
+                                "condition": text[:240],
+                            }
+                        )
+                        findings.append(
+                            Finding(
+                                "CG801",
+                                "note",
+                                "medium",
+                                relative,
+                                decorator.lineno,
+                                _ast_column(source, decorator),
+                                getattr(node, "name", "test"),
+                                "Test has an explicit platform-related skip condition.",
+                                f"Detected target platform(s): {', '.join(platforms)}. Condition is shown as source text only.",
+                            )
+                        )
     return findings, skipped
 
 
-def scan_project(root_path: str | Path, supported_override: list[str] | None = None) -> dict:
-    root = Path(root_path).resolve()
+def scan_project(
+    root_path: str | Path,
+    supported_override: list[str] | None = None,
+    *,
+    _input_paths: list[Path] | None = None,
+) -> dict:
+    try:
+        root = Path(root_path).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("Could not resolve project path safely.") from exc
     if not root.is_dir():
         raise ValueError(f"Project path is not a directory: {root}")
     code_findings: list[Finding] = []
     skips: list[dict] = []
     python_files: list[Path] = []
+    file_limit_reached = False
     for current, dirs, files in os.walk(root, followlinks=False):
         current_path = Path(current)
         allowed_dirs = []
@@ -599,7 +1264,7 @@ def scan_project(root_path: str | Path, supported_override: list[str] | None = N
                 continue
             try:
                 resolved = candidate.resolve(strict=True)
-            except OSError:
+            except (OSError, RuntimeError):
                 continue
             if resolved.is_relative_to(root):
                 allowed_dirs.append(name)
@@ -608,51 +1273,213 @@ def scan_project(root_path: str | Path, supported_override: list[str] | None = N
             if name.endswith(".py"):
                 candidate = current_path / name
                 relative = candidate.relative_to(root).as_posix()
+                if _input_paths is not None:
+                    _input_paths.append(candidate)
+                if len(python_files) >= MAX_PYTHON_FILES:
+                    code_findings.append(
+                        Finding(
+                            "CG904",
+                            "warning",
+                            "high",
+                            relative,
+                            1,
+                            1,
+                            "source file limit",
+                            f"Python scan stopped at the {MAX_PYTHON_FILES}-file limit.",
+                            "The project contains more Python files than CrossGrid analyzes in one run.",
+                        )
+                    )
+                    file_limit_reached = True
+                    break
                 if not _safe_project_path(root, candidate):
-                    code_findings.append(Finding("CG904", "warning", "high", relative, 1, 1, "source path", "Unsafe or symlinked Python source was skipped.", "CrossGrid does not follow symlinks or read paths outside the scan root."))
+                    code_findings.append(
+                        Finding(
+                            "CG904",
+                            "warning",
+                            "high",
+                            relative,
+                            1,
+                            1,
+                            "source path",
+                            "Unsafe or symlinked Python source was skipped.",
+                            "CrossGrid does not follow symlinks or read paths outside the scan root.",
+                        )
+                    )
                     continue
-                python_files.append(candidate.resolve(strict=True))
+                try:
+                    python_files.append(candidate.resolve(strict=True))
+                except (OSError, RuntimeError):
+                    code_findings.append(
+                        Finding(
+                            "CG904",
+                            "warning",
+                            "high",
+                            relative,
+                            1,
+                            1,
+                            "source path",
+                            "Python source path could not be resolved safely.",
+                            "CrossGrid does not follow paths that change or fail to resolve during scanning.",
+                        )
+                    )
+        if file_limit_reached:
+            dirs[:] = []
+            break
+
+    source_bytes = 0
     for path in sorted(python_files):
+        try:
+            file_size = path.stat().st_size
+        except OSError:
+            file_size = 0
+        if file_size > MAX_PYTHON_SOURCE_BYTES:
+            code_findings.append(
+                Finding(
+                    "CG904",
+                    "warning",
+                    "high",
+                    path.relative_to(root).as_posix(),
+                    1,
+                    1,
+                    "source size limit",
+                    f"Python source exceeds the {MAX_PYTHON_SOURCE_BYTES}-byte per-file limit.",
+                    "This file was not read or analyzed.",
+                )
+            )
+            continue
+        if source_bytes + file_size > MAX_TOTAL_SOURCE_BYTES:
+            code_findings.append(
+                Finding(
+                    "CG904",
+                    "warning",
+                    "high",
+                    path.relative_to(root).as_posix(),
+                    1,
+                    1,
+                    "total source size limit",
+                    f"Python source scan stopped at the {MAX_TOTAL_SOURCE_BYTES}-byte total input limit.",
+                    "Remaining Python files were not read or analyzed.",
+                )
+            )
+            break
+        source_bytes += file_size
         findings, file_skips = _scan_python(path, root)
         code_findings.extend(findings)
         skips.extend(file_skips)
 
-    declared, metadata_findings = _read_project_platforms(root)
-    runners, ci_platforms, workflow_findings = _scan_workflows(root)
+    declared, metadata_findings = _read_project_platforms(root, _input_paths)
+    runners, ci_platforms, workflow_findings = _scan_workflows(root, _input_paths)
     target_platforms = set(supported_override) if supported_override else declared
-    scope_source = "command-line override" if supported_override else "project classifiers" if declared else "not declared"
+    scope_source = (
+        "command-line override"
+        if supported_override
+        else "project classifiers"
+        if declared
+        else "not declared"
+    )
     if not target_platforms and ci_platforms:
         scope_source = "CI runners only; support is not declared"
     findings = [*metadata_findings, *workflow_findings, *code_findings]
 
     if not python_files:
-        findings.append(Finding("CG900", "note", "high", ".", 1, 1, "project", "No Python source files were found.", "Check the scan root and ignored-directory rules."))
+        findings.append(
+            Finding(
+                "CG900",
+                "note",
+                "high",
+                ".",
+                1,
+                1,
+                "project",
+                "No Python source files were found.",
+                "Check the scan root and ignored-directory rules.",
+            )
+        )
     if not runners:
-        findings.append(Finding("CG902", "warning", "high", ".github/workflows", 1, 1, "test CI", "No explicit GitHub Actions runner was identified.", "Other CI providers and dynamically inherited workflows are not analyzed."))
+        findings.append(
+            Finding(
+                "CG902",
+                "warning",
+                "high",
+                ".github/workflows",
+                1,
+                1,
+                "test CI",
+                "No explicit GitHub Actions runner was identified.",
+                "Other CI providers and dynamically inherited workflows are not analyzed.",
+            )
+        )
     elif not ci_platforms:
-        findings.append(Finding("CG902", "warning", "high", ".github/workflows", 1, 1, "test CI", "No recognized OS runner in a test-like job was identified.", "The tool only counts test-like jobs with explicit OS labels."))
+        findings.append(
+            Finding(
+                "CG902",
+                "warning",
+                "high",
+                ".github/workflows",
+                1,
+                1,
+                "test CI",
+                "No recognized OS runner in a test-like job was identified.",
+                "The tool only counts test-like jobs with explicit OS labels.",
+            )
+        )
     if not target_platforms:
-        findings.append(Finding("CG903", "note", "high", "pyproject.toml", 1, 1, "support scope", "No supported OS scope was declared or supplied.", "CrossGrid will not infer a support guarantee from source code."))
+        findings.append(
+            Finding(
+                "CG903",
+                "note",
+                "high",
+                "pyproject.toml",
+                1,
+                1,
+                "support scope",
+                "No supported OS scope was declared or supplied.",
+                "CrossGrid will not infer a support guarantee from source code.",
+            )
+        )
 
     platform_rows = []
     for platform in ("windows", "linux", "macos"):
         if platform not in target_platforms:
             continue
-        matches = [runner for runner in runners if runner["test_evidence"] and platform in runner["platforms"]]
+        matches = [
+            runner
+            for runner in runners
+            if runner["test_evidence"] and platform in runner["platforms"]
+        ]
         skipped_tests = [row for row in skips if platform in row["platforms"]]
-        platform_rows.append({
-            "platform": platform,
-            "declared": platform in declared,
-            "in_scope": platform in target_platforms,
-            "test_ci_present": bool(matches),
-            "test_jobs": [{"workflow": row["workflow"], "job": row["job"], "runners": row["runners"]} for row in matches],
-            "platform_skip_count": len(skipped_tests),
-            "platform_skips": skipped_tests,
-        })
+        platform_rows.append(
+            {
+                "platform": platform,
+                "declared": platform in declared,
+                "in_scope": platform in target_platforms,
+                "test_ci_present": bool(matches),
+                "test_jobs": [
+                    {
+                        "workflow": row["workflow"],
+                        "job": row["job"],
+                        "runners": row["runners"],
+                    }
+                    for row in matches
+                ],
+                "platform_skip_count": len(skipped_tests),
+                "platform_skips": skipped_tests,
+            }
+        )
         if not matches:
-            findings.append(Finding("CG901", "warning", "high", ".github/workflows", 1, 1, platform,
-                                    f"Project support scope includes {platform}, but no explicit test-like GitHub Actions runner was found.",
-                                    "This is a CI coverage gap signal, not proof that tests are absent from another CI provider."))
+            findings.append(
+                Finding(
+                    "CG901",
+                    "warning",
+                    "high",
+                    ".github/workflows",
+                    1,
+                    1,
+                    platform,
+                    f"Project support scope includes {platform}, but no explicit test-like GitHub Actions runner was found.",
+                    "This is a CI coverage gap signal, not proof that tests are absent from another CI provider.",
+                )
+            )
 
     findings.sort(key=lambda item: (item.file, item.line, item.rule_id, item.subject))
     summary = {
@@ -688,24 +1515,62 @@ def report_exit_code(report: dict, fail_on: str = "error") -> int:
         return 0
     severity_rank = {"note": 0, "review": 1, "warning": 2, "error": 3}
     threshold = severity_rank[fail_on]
-    return 1 if any(severity_rank[item["severity"]] >= threshold for item in report["findings"]) else 0
+    return (
+        1
+        if any(
+            severity_rank[item["severity"]] >= threshold for item in report["findings"]
+        )
+        else 0
+    )
 
 
 def render_sarif(report: dict) -> dict:
     rule_ids = sorted({item["rule_id"] for item in report["findings"]})
     results = []
     for item in report["findings"]:
-        results.append({
-            "ruleId": item["rule_id"],
-            "level": {"error": "error", "warning": "warning", "review": "note", "note": "note"}[item["severity"]],
-            "message": {"text": item["message"]},
-            "locations": [{"physicalLocation": {"artifactLocation": {"uri": item["file"]}, "region": {"startLine": item["line"], "startColumn": item["column"]}}}],
-            "properties": {"confidence": item["confidence"], "subject": item["subject"], "evidence": item["evidence"]},
-        })
+        results.append(
+            {
+                "ruleId": item["rule_id"],
+                "level": {
+                    "error": "error",
+                    "warning": "warning",
+                    "review": "note",
+                    "note": "note",
+                }[item["severity"]],
+                "message": {"text": item["message"]},
+                "locations": [
+                    {
+                        "physicalLocation": {
+                            "artifactLocation": {"uri": item["file"]},
+                            "region": {
+                                "startLine": item["line"],
+                                "startColumn": item["column"],
+                            },
+                        }
+                    }
+                ],
+                "properties": {
+                    "confidence": item["confidence"],
+                    "subject": item["subject"],
+                    "evidence": item["evidence"],
+                },
+            }
+        )
     return {
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
         "version": "2.1.0",
-        "runs": [{"tool": {"driver": {"name": "CrossGrid", "version": "0.1.0", "rules": [{"id": rule_id} for rule_id in rule_ids]}}, "results": results}],
+        "runs": [
+            {
+                "tool": {
+                    "driver": {
+                        "name": "CrossGrid",
+                        "version": "0.1.0",
+                        "rules": [{"id": rule_id} for rule_id in rule_ids],
+                    }
+                },
+                "results": results,
+            }
+        ],
     }
 
 
@@ -715,28 +1580,46 @@ def render_html(report: dict) -> str:
     rows = []
     for item in report["findings"]:
         rows.append(
-            "<tr><td><span class=\"severity {severity}\">{severity}</span></td><td><code>{rule}</code></td>"
+            '<tr><td><span class="severity {severity}">{severity}</span></td><td><code>{rule}</code></td>'
             "<td><strong>{subject}</strong><p>{message}</p><small>{evidence}</small></td>"
             "<td><code>{file}:{line}</code></td><td>{confidence}</td></tr>".format(
-                severity=html.escape(item["severity"]), rule=html.escape(item["rule_id"]),
-                subject=html.escape(item["subject"]), message=html.escape(item["message"]),
-                evidence=html.escape(item["evidence"]), file=html.escape(item["file"]),
-                line=item["line"], confidence=html.escape(item["confidence"]),
+                severity=html.escape(item["severity"]),
+                rule=html.escape(item["rule_id"]),
+                subject=html.escape(item["subject"]),
+                message=html.escape(item["message"]),
+                evidence=html.escape(item["evidence"]),
+                file=html.escape(item["file"]),
+                line=item["line"],
+                confidence=html.escape(item["confidence"]),
             )
         )
-    finding_rows = "\n".join(rows) or '<tr><td colspan="5" class="empty">No static review signals found. This is not a portability guarantee.</td></tr>'
+    finding_rows = (
+        "\n".join(rows)
+        or '<tr><td colspan="5" class="empty">No static review signals found. This is not a portability guarantee.</td></tr>'
+    )
     platform_cards = []
     for row in report["platforms"]:
         platform_cards.append(
-            "<article class=\"platform\"><div class=\"platform-name\">{name}</div><div class=\"status {status}\">{status_label}</div>"
+            '<article class="platform"><div class="platform-name">{name}</div><div class="status {status}">{status_label}</div>'
             "<p>{jobs}</p><small>{skips} platform-related skip marker(s)</small></article>".format(
-                name=html.escape(row["platform"]), status="covered" if row["test_ci_present"] else "gap",
-                status_label="TEST CI FOUND" if row["test_ci_present"] else "NO TEST RUNNER FOUND",
-                jobs=html.escape(", ".join(f"{job['workflow']} · {job['job']}" for job in row["test_jobs"]) or "No explicit test job detected"),
+                name=html.escape(row["platform"]),
+                status="covered" if row["test_ci_present"] else "gap",
+                status_label="TEST CI FOUND"
+                if row["test_ci_present"]
+                else "NO TEST RUNNER FOUND",
+                jobs=html.escape(
+                    ", ".join(
+                        f"{job['workflow']} · {job['job']}" for job in row["test_jobs"]
+                    )
+                    or "No explicit test job detected"
+                ),
                 skips=row["platform_skip_count"],
             )
         )
-    cards = "".join(platform_cards) or '<div class="empty-card">Declare target OSes in project metadata or pass --platform to build a coverage grid.</div>'
+    cards = (
+        "".join(platform_cards)
+        or '<div class="empty-card">Declare target OSes in project metadata or pass --platform to build a coverage grid.</div>'
+    )
     limits = "".join(f"<li>{html.escape(limit)}</li>" for limit in report["limits"])
     summary = report["summary"]
     return f"""<!doctype html>
@@ -752,10 +1635,10 @@ header{{display:flex;justify-content:space-between;align-items:center;border-top
 @media(max-width:760px){{.intro{{grid-template-columns:1fr;align-items:start;padding:27px 0}}.score{{border-left:0;border-top:1px solid var(--line);padding:12px 0 0}}.score strong{{font-size:52px}}.grid{{grid-template-columns:1fr}}.toolbar{{align-items:start;flex-direction:column}}input{{width:100%}}footer{{flex-direction:column}}header{{align-items:start;gap:12px;flex-direction:column}}.scope{{text-align:left}}}}
 @media(prefers-color-scheme:dark){{:root{{--night:#091d26;--ink:#dce9e5;--paper:#0e1b20;--panel:#17292e;--line:#334a4f;--muted:#a0b4b2;--sea:#35d3c6;--sea-dark:#70ded2;--orange:#f29670}}.limits{{background:#203239}}th{{background:var(--night)}}}}
 @media(prefers-reduced-motion:reduce){{*,*::before,*::after{{scroll-behavior:auto!important;transition:none!important}}}}
-</style></head><body><main class="layout"><header><div class="brand"><b>CG</b> CrossGrid · Python OS coverage</div><div class="scope">SCOPE: {html.escape(report['scope_source'])} · FILES: {summary['python_files']}</div></header>
-<section class="intro"><div><div class="kicker">Repository portability review</div><h1>Support is a matrix.<br>Make the gaps visible.</h1><p>This report connects declared operating systems to explicit test runners, platform skips and source review signals. It does not execute the project on other operating systems.</p></div><div class="score"><strong>{summary['findings']:02d}</strong><span>review signals · {summary['warnings']} warnings · {summary['reviews']} cautions</span></div></section>
+</style></head><body><main class="layout"><header><div class="brand"><b>CG</b> CrossGrid · Python OS coverage</div><div class="scope">SCOPE: {html.escape(report["scope_source"])} · FILES: {summary["python_files"]}</div></header>
+<section class="intro"><div><div class="kicker">Repository portability review</div><h1>Support is a matrix.<br>Make the gaps visible.</h1><p>This report connects declared operating systems to explicit test runners, platform skips and source review signals. It does not execute the project on other operating systems.</p></div><div class="score"><strong>{summary["findings"]:02d}</strong><span>review signals · {summary["warnings"]} warnings · {summary["reviews"]} cautions</span></div></section>
 <section><div class="section-bar"><h2>Support coverage</h2><p>runner evidence ≠ successful test execution</p></div><div class="grid">{cards}</div></section>
-<section class="findings"><div class="section-bar"><h2>Evidence register</h2><p>{summary['test_ci_platforms'] and html.escape(', '.join(summary['test_ci_platforms'])) or 'NO TEST OS DETECTED'}</p></div><div class="toolbar"><label>Filter this report<input id="filter" type="search" placeholder="rule, path, API, or message" aria-label="Filter report findings"></label><span class="counter">{summary['findings']} finding(s)</span></div>
+<section class="findings"><div class="section-bar"><h2>Evidence register</h2><p>{summary["test_ci_platforms"] and html.escape(", ".join(summary["test_ci_platforms"])) or "NO TEST OS DETECTED"}</p></div><div class="toolbar"><label>Filter this report<input id="filter" type="search" placeholder="rule, path, API, or message" aria-label="Filter report findings"></label><span class="counter">{summary["findings"]} finding(s)</span></div>
 <div class="table-box"><table><thead><tr><th>Kind</th><th>Rule</th><th>Signal and evidence</th><th>Location</th><th>Confidence</th></tr></thead><tbody id="findings">{finding_rows}</tbody></table></div></section>
 <section class="limits"><h2>Limits of this scan</h2><ul>{limits}</ul></section>
 <footer><span>CrossGrid · local static analysis · no files changed</span><span>Review each finding before changing code or CI.</span></footer></main>

@@ -4,7 +4,7 @@ import tempfile
 import unittest
 import json
 from argparse import Namespace
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -26,7 +26,9 @@ class CrossGridTests(unittest.TestCase):
         path.write_text(content, encoding="utf-8")
 
     def test_maps_declared_os_to_explicit_test_ci_runners_and_skips(self) -> None:
-        self.write("pyproject.toml", """
+        self.write(
+            "pyproject.toml",
+            """
 [project]
 name = "fixture"
 classifiers = [
@@ -34,8 +36,11 @@ classifiers = [
   "Operating System :: POSIX :: Linux",
   "Operating System :: MacOS",
 ]
-""")
-        self.write(".github/workflows/tests.yml", """
+""",
+        )
+        self.write(
+            ".github/workflows/tests.yml",
+            """
 name: test matrix
 on: [push]
 jobs:
@@ -51,15 +56,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: ruff check .
-""")
-        self.write("tests/test_sample.py", """
+""",
+        )
+        self.write(
+            "tests/test_sample.py",
+            """
 import sys
 import pytest
 
 @pytest.mark.skipif(sys.platform == "win32", reason="uses a Unix socket")
 def test_unix_socket():
     pass
-""")
+""",
+        )
 
         report = scan_project(self.root)
         rows = {row["platform"]: row for row in report["platforms"]}
@@ -68,11 +77,16 @@ def test_unix_socket():
         self.assertTrue(rows["linux"]["test_ci_present"])
         self.assertFalse(rows["macos"]["test_ci_present"])
         self.assertEqual(rows["windows"]["platform_skip_count"], 1)
-        self.assertIn("macos", [row["subject"] for row in report["findings"] if row["rule_id"] == "CG901"])
+        self.assertIn(
+            "macos",
+            [row["subject"] for row in report["findings"] if row["rule_id"] == "CG901"],
+        )
         self.assertIn("windows", report["summary"]["declared_platforms"])
 
     def test_test_job_detection_uses_names_and_test_tools_not_substrings(self) -> None:
-        self.write(".github/workflows/ci.yml", """
+        self.write(
+            ".github/workflows/ci.yml",
+            """
 jobs:
   release-latest:
     runs-on: ubuntu-latest
@@ -83,12 +97,17 @@ jobs:
     runs-on: windows-latest
     steps:
       - run: python -m pytest
-""")
+""",
+        )
         report = scan_project(self.root, supported_override=["linux", "windows"])
         self.assertEqual(report["summary"]["test_ci_platforms"], ["windows"])
 
-    def test_installing_or_mentioning_test_tools_does_not_count_as_running_tests(self) -> None:
-        self.write(".github/workflows/ci.yml", """
+    def test_installing_or_mentioning_test_tools_does_not_count_as_running_tests(
+        self,
+    ) -> None:
+        self.write(
+            ".github/workflows/ci.yml",
+            """
 jobs:
   build:
     runs-on: windows-latest
@@ -97,12 +116,17 @@ jobs:
         run: python -m pip install pytest
       - name: Print command example
         run: echo pytest
-""")
+""",
+        )
         report = scan_project(self.root, supported_override=["windows"])
         self.assertEqual(report["summary"]["test_ci_platforms"], [])
 
-    def test_help_version_and_collection_only_commands_do_not_count_as_test_runs(self) -> None:
-        self.write(".github/workflows/ci.yml", """
+    def test_help_version_and_collection_only_commands_do_not_count_as_test_runs(
+        self,
+    ) -> None:
+        self.write(
+            ".github/workflows/ci.yml",
+            """
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -127,12 +151,15 @@ jobs:
       - run: tox -e unit-tests --devenv=/tmp/test-env
       - run: tox -e unit-tests --devenv /tmp/test-env
       - run: nox -s lint
-""")
+""",
+        )
         report = scan_project(self.root, supported_override=["linux", "windows"])
         self.assertEqual(report["summary"]["test_ci_platforms"], [])
 
     def test_test_commands_support_environment_and_common_wrappers(self) -> None:
-        self.write(".github/workflows/ci.yml", """
+        self.write(
+            ".github/workflows/ci.yml",
+            """
 jobs:
   linux-check:
     runs-on: ubuntu-latest
@@ -148,12 +175,19 @@ jobs:
       - run: coverage run -m pytest -q
       - run: tox run -e unit-tests
       - run: nox -s integration-tests
-""")
-        report = scan_project(self.root, supported_override=["linux", "windows", "macos"])
-        self.assertEqual(report["summary"]["test_ci_platforms"], ["linux", "macos", "windows"])
+""",
+        )
+        report = scan_project(
+            self.root, supported_override=["linux", "windows", "macos"]
+        )
+        self.assertEqual(
+            report["summary"]["test_ci_platforms"], ["linux", "macos", "windows"]
+        )
 
     def test_runner_matrix_include_is_counted(self) -> None:
-        self.write(".github/workflows/tests.yml", """
+        self.write(
+            ".github/workflows/tests.yml",
+            """
 jobs:
   test:
     runs-on: ${{ matrix.os }}
@@ -164,12 +198,15 @@ jobs:
           - os: windows-latest
     steps:
       - run: pytest
-""")
+""",
+        )
         report = scan_project(self.root, supported_override=["linux", "windows"])
         self.assertEqual(report["summary"]["test_ci_platforms"], ["linux", "windows"])
 
     def test_static_runs_on_does_not_inherit_unrelated_matrix_os_values(self) -> None:
-        self.write(".github/workflows/tests.yml", """
+        self.write(
+            ".github/workflows/tests.yml",
+            """
 jobs:
   tests:
     runs-on: ubuntu-latest
@@ -180,12 +217,17 @@ jobs:
           - os: macos-latest
     steps:
       - run: pytest
-""")
-        report = scan_project(self.root, supported_override=["linux", "windows", "macos"])
+""",
+        )
+        report = scan_project(
+            self.root, supported_override=["linux", "windows", "macos"]
+        )
         self.assertEqual(report["summary"]["test_ci_platforms"], ["linux"])
 
     def test_matrix_exclusions_remove_only_excluded_runner_combinations(self) -> None:
-        self.write(".github/workflows/tests.yml", """
+        self.write(
+            ".github/workflows/tests.yml",
+            """
 jobs:
   tests:
     runs-on: ${{ matrix.os }}
@@ -198,12 +240,15 @@ jobs:
             python: "3.11"
     steps:
       - run: pytest
-""")
+""",
+        )
         report = scan_project(self.root, supported_override=["linux", "windows"])
         self.assertEqual(report["summary"]["test_ci_platforms"], ["linux", "windows"])
 
     def test_derived_matrix_expression_is_left_unclassified(self) -> None:
-        self.write(".github/workflows/tests.yml", """
+        self.write(
+            ".github/workflows/tests.yml",
+            """
 jobs:
   tests:
     runs-on: ${{ matrix.os == 'windows-latest' && 'ubuntu-latest' || 'macos-latest' }}
@@ -212,26 +257,40 @@ jobs:
         os: [windows-latest]
     steps:
       - run: pytest
-""")
-        report = scan_project(self.root, supported_override=["linux", "windows", "macos"])
+""",
+        )
+        report = scan_project(
+            self.root, supported_override=["linux", "windows", "macos"]
+        )
         self.assertEqual(report["summary"]["test_ci_platforms"], [])
 
     def test_generic_posix_classifier_does_not_infer_linux_and_macos(self) -> None:
-        self.write("pyproject.toml", '[project]\nname="fixture"\nclassifiers=["Operating System :: POSIX"]\n')
+        self.write(
+            "pyproject.toml",
+            '[project]\nname="fixture"\nclassifiers=["Operating System :: POSIX"]\n',
+        )
         report = scan_project(self.root)
         self.assertEqual(report["summary"]["declared_platforms"], [])
         self.assertEqual(report["platforms"], [])
 
-    def test_valid_toml_with_non_table_project_or_tool_is_reported_not_crashed(self) -> None:
+    def test_valid_toml_with_non_table_project_or_tool_is_reported_not_crashed(
+        self,
+    ) -> None:
         for content in ('project = "fixture"\n', 'tool = "fixture"\n'):
             with self.subTest(content=content):
                 self.write("pyproject.toml", content)
                 report = scan_project(self.root)
-                metadata = [item for item in report["findings"] if item["rule_id"] == "CG902" and item["file"] == "pyproject.toml"]
+                metadata = [
+                    item
+                    for item in report["findings"]
+                    if item["rule_id"] == "CG902" and item["file"] == "pyproject.toml"
+                ]
                 self.assertTrue(metadata)
 
     def test_pathlib_open_mode_and_archive_open_are_classified_by_api(self) -> None:
-        self.write("source.py", """
+        self.write(
+            "source.py",
+            """
 from pathlib import Path
 from zipfile import ZipFile
 
@@ -244,14 +303,19 @@ handle = Path("variable.txt")
 handle.open("rb")
 handle.open()
 ZipFile("archive.zip").open("member.bin")
-""")
+""",
+        )
         report = scan_project(self.root)
         findings = [item for item in report["findings"] if item["rule_id"] == "CG201"]
         self.assertEqual(len(findings), 2)
         self.assertEqual({item["subject"] for item in findings}, {"pathlib.Path.open"})
 
-    def test_path_variable_inference_is_disabled_for_shadowed_or_reassigned_names(self) -> None:
-        self.write("source.py", """
+    def test_path_variable_inference_is_disabled_for_shadowed_or_reassigned_names(
+        self,
+    ) -> None:
+        self.write(
+            "source.py",
+            """
 from pathlib import Path
 
 def build_path():
@@ -264,12 +328,15 @@ def custom_reader(item):
 item = Path("safe.txt")
 item = object()
 item.open()
-""")
+""",
+        )
         report = scan_project(self.root)
         self.assertFalse(any(item["rule_id"] == "CG201" for item in report["findings"]))
 
     def test_pattern_capture_bindings_disable_path_variable_inference(self) -> None:
-        self.write("source.py", """
+        self.write(
+            "source.py",
+            """
 from pathlib import Path
 
 as_path = Path("one.txt")
@@ -285,52 +352,78 @@ match value:
 as_path.open()
 star_path.open()
 rest_path.open()
-""")
+""",
+        )
         report = scan_project(self.root)
         self.assertFalse(any(item["rule_id"] == "CG201" for item in report["findings"]))
 
-    def test_pep263_source_encoding_is_parsed_and_ast_columns_are_character_based(self) -> None:
+    def test_pep263_source_encoding_is_parsed_and_ast_columns_are_character_based(
+        self,
+    ) -> None:
         source = '# coding: latin-1\ncafé = 1; open("data.txt")\n'
         (self.root / "encoded.py").write_bytes(source.encode("latin-1"))
         report = scan_project(self.root)
-        finding = next(item for item in report["findings"] if item["rule_id"] == "CG201")
+        finding = next(
+            item for item in report["findings"] if item["rule_id"] == "CG201"
+        )
         self.assertEqual(finding["column"], source.splitlines()[1].index("open") + 1)
 
     def test_skip_reason_is_not_mistaken_for_the_platform_condition(self) -> None:
-        self.write("tests/test_skip.py", """
+        self.write(
+            "tests/test_skip.py",
+            """
 import os
 import pytest
 
 @pytest.mark.skipif(os.getenv("CI"), reason="Windows runner unavailable")
 def test_ci_only():
     pass
-""")
+""",
+        )
         report = scan_project(self.root, supported_override=["windows"])
         self.assertFalse(any(item["rule_id"] == "CG801" for item in report["findings"]))
 
-    def test_keyword_skip_condition_and_underscored_test_job_are_recognized(self) -> None:
-        self.write(".github/workflows/tests.yml", """
+    def test_keyword_skip_condition_and_underscored_test_job_are_recognized(
+        self,
+    ) -> None:
+        self.write(
+            ".github/workflows/tests.yml",
+            """
 jobs:
   unit_tests:
     runs-on: windows-latest
     steps:
       - run: make check
-""")
-        self.write("tests/test_skip.py", """
+""",
+        )
+        self.write(
+            "tests/test_skip.py",
+            """
 import pytest
 
 @pytest.mark.skipif(condition="sys.platform == 'win32'", reason="Windows-specific reason")
 def test_something():
     pass
-""")
+""",
+        )
         report = scan_project(self.root, supported_override=["windows"])
         self.assertEqual(report["summary"]["test_ci_platforms"], ["windows"])
         self.assertEqual(report["platforms"][0]["platform_skip_count"], 1)
 
-    def test_ast_detects_platform_api_import_encoding_and_shell_with_guard_evidence(self) -> None:
-        self.write("pyproject.toml", '[project]\nname="fixture"\nclassifiers=["Operating System :: Microsoft :: Windows"]\n')
-        self.write(".github/workflows/tests.yaml", "jobs:\n  tests:\n    runs-on: windows-latest\n    steps:\n      - run: pytest\n")
-        self.write("src/app.py", """
+    def test_ast_detects_platform_api_import_encoding_and_shell_with_guard_evidence(
+        self,
+    ) -> None:
+        self.write(
+            "pyproject.toml",
+            '[project]\nname="fixture"\nclassifiers=["Operating System :: Microsoft :: Windows"]\n',
+        )
+        self.write(
+            ".github/workflows/tests.yaml",
+            "jobs:\n  tests:\n    runs-on: windows-latest\n    steps:\n      - run: pytest\n",
+        )
+        self.write(
+            "src/app.py",
+            """
 import os as operating
 import pwd
 import subprocess
@@ -353,20 +446,35 @@ def files():
 
 def shell():
     subprocess.run("echo hi", shell=True)
-""")
+""",
+        )
         report = scan_project(self.root)
         ids = [item["rule_id"] for item in report["findings"]]
         self.assertIn("CG101", ids)
         self.assertIn("CG102", ids)
         self.assertIn("CG201", ids)
         self.assertIn("CG301", ids)
-        self.assertEqual(ids.count("CG201"), 2, "binary opens should not need an encoding; encoding=None still uses the platform default")
-        self.assertIn("signal.SIGKILL", [item["subject"] for item in report["findings"]])
-        unguarded = next(item for item in report["findings"] if item["rule_id"] == "CG102" and item["subject"] == "os.getuid")
+        self.assertEqual(
+            ids.count("CG201"),
+            2,
+            "binary opens should not need an encoding; encoding=None still uses the platform default",
+        )
+        self.assertIn(
+            "signal.SIGKILL", [item["subject"] for item in report["findings"]]
+        )
+        unguarded = next(
+            item
+            for item in report["findings"]
+            if item["rule_id"] == "CG102" and item["subject"] == "os.getuid"
+        )
         self.assertEqual(unguarded["confidence"], "high")
 
-    def test_importerror_and_platform_guards_are_marked_as_review_not_unprotected(self) -> None:
-        self.write("src/guarded.py", """
+    def test_importerror_and_platform_guards_are_marked_as_review_not_unprotected(
+        self,
+    ) -> None:
+        self.write(
+            "src/guarded.py",
+            """
 import sys
 if sys.platform == "win32":
     import fcntl
@@ -374,19 +482,27 @@ try:
     import pwd
 except ImportError:
     pwd = None
-""")
+""",
+        )
         report = scan_project(self.root, supported_override=["windows"])
         rows = [item for item in report["findings"] if item["rule_id"] == "CG101"]
-        self.assertEqual({item["subject"]: item["confidence"] for item in rows}, {"fcntl": "review", "pwd": "review"})
+        self.assertEqual(
+            {item["subject"]: item["confidence"] for item in rows},
+            {"fcntl": "review", "pwd": "review"},
+        )
 
     def test_detects_current_windows_registry_module_import_forms(self) -> None:
-        self.write("src/windows_registry.py", "import winreg\nfrom winreg import OpenKey\n")
+        self.write(
+            "src/windows_registry.py", "import winreg\nfrom winreg import OpenKey\n"
+        )
         report = scan_project(self.root, supported_override=["windows"])
         rows = [item for item in report["findings"] if item["rule_id"] == "CG101"]
         self.assertEqual([item["subject"] for item in rows], ["winreg", "winreg"])
         self.assertEqual([item["line"] for item in rows], [1, 2])
 
-    def test_bad_syntax_and_bad_workflow_are_reported_without_stopping_scan(self) -> None:
+    def test_bad_syntax_and_bad_workflow_are_reported_without_stopping_scan(
+        self,
+    ) -> None:
         self.write(".github/workflows/broken.yml", "jobs: [this is not a mapping")
         self.write("broken.py", "def unfinished(:\n")
         report = scan_project(self.root, supported_override=["linux"])
@@ -394,6 +510,101 @@ except ImportError:
         self.assertIn("CG903", ids)
         self.assertIn("CG905", ids)
         self.assertEqual(report["summary"]["python_files"], 1)
+
+    def test_deep_yaml_and_python_inputs_are_reported_without_tracebacks(self) -> None:
+        self.write(".github/workflows/deep.yml", "jobs: {}\n")
+        self.write("deep.py", "value = True\n")
+        with (
+            patch("crossgrid.scanner.yaml.safe_load", side_effect=RecursionError),
+            patch("crossgrid.scanner.ast.parse", side_effect=RecursionError),
+        ):
+            report = scan_project(self.root)
+        findings = {(item["rule_id"], item["file"]) for item in report["findings"]}
+        self.assertIn(("CG903", ".github/workflows/deep.yml"), findings)
+        self.assertIn(("CG905", "deep.py"), findings)
+
+    def test_python_scan_enforces_file_and_total_byte_limits(self) -> None:
+        from crossgrid import scanner
+
+        self.write("a.py", "a=1\n")
+        self.write("b.py", "b=2\n")
+        with patch.object(scanner, "MAX_PYTHON_FILES", 1):
+            file_limited = scan_project(self.root)
+        self.assertEqual(file_limited["summary"]["python_files"], 1)
+        self.assertTrue(
+            any(
+                item["subject"] == "source file limit"
+                for item in file_limited["findings"]
+            )
+        )
+
+        with patch.object(scanner, "MAX_TOTAL_SOURCE_BYTES", 4):
+            byte_limited = scan_project(self.root)
+        self.assertTrue(
+            any(
+                item["subject"] == "total source size limit"
+                for item in byte_limited["findings"]
+            )
+        )
+
+    def test_oversized_source_is_reported_without_reading_the_whole_file(self) -> None:
+        from crossgrid import scanner
+
+        self.write("large.py", "import os\n")
+        source = self.root / "large.py"
+        with patch.object(scanner, "MAX_PYTHON_SOURCE_BYTES", 4):
+            report = scan_project(self.root)
+        self.assertTrue(
+            any(
+                item["rule_id"] == "CG904" and item["subject"] == "source size limit"
+                for item in report["findings"]
+            )
+        )
+        self.assertEqual(source.read_text(encoding="utf-8"), "import os\n")
+
+    def test_workflow_scan_enforces_file_and_aggregate_size_limits(self) -> None:
+        from crossgrid import scanner
+
+        self.write(".github/workflows/a.yml", "jobs: {}\n")
+        self.write(".github/workflows/b.yaml", "jobs: {}\n")
+        with patch.object(scanner, "MAX_WORKFLOW_FILES", 1):
+            file_limited = scan_project(self.root)
+        self.assertTrue(
+            any(
+                item["subject"] == "workflow file limit"
+                for item in file_limited["findings"]
+            )
+        )
+
+        with patch.object(scanner, "MAX_TOTAL_WORKFLOW_BYTES", len("jobs: {}\n")):
+            byte_limited = scan_project(self.root)
+        self.assertTrue(
+            any(
+                item["subject"] == "total workflow size limit"
+                for item in byte_limited["findings"]
+            )
+        )
+
+    def test_git_pointer_marker_is_bounded(self) -> None:
+        from crossgrid.cli import run
+        from crossgrid import scanner
+
+        marker = self.root / ".git"
+        marker.write_text("x" * (scanner.MAX_GIT_MARKER_BYTES + 1), encoding="utf-8")
+        output = self.root.parent / "marker-check.json"
+        args = Namespace(
+            root=str(self.root),
+            platform=None,
+            html=None,
+            json_path=str(output),
+            sarif=None,
+            fail_on="error",
+        )
+        errors = StringIO()
+        with redirect_stderr(errors):
+            self.assertEqual(run(args), 2)
+        self.assertIn("size limit", errors.getvalue())
+        self.assertFalse(output.exists())
 
     def test_skips_python_symlinks_and_does_not_read_outside_scan_root(self) -> None:
         symlink_candidate = self.root / "linked.py"
@@ -411,68 +622,134 @@ except ImportError:
                 return self.root.parent / "outside-project.py"
             return original_resolve(path, strict=strict)
 
-        with patch.object(Path, "is_symlink", fake_is_symlink), patch.object(Path, "resolve", fake_resolve):
+        with (
+            patch.object(Path, "is_symlink", fake_is_symlink),
+            patch.object(Path, "resolve", fake_resolve),
+        ):
             report = scan_project(self.root)
 
         self.assertEqual(report["summary"]["python_files"], 0)
         skipped = [item for item in report["findings"] if item["rule_id"] == "CG904"]
-        self.assertEqual({item["file"] for item in skipped}, {"linked.py", "escaped.py"})
-        self.assertFalse(any(item["subject"] in {"fcntl", "pwd"} for item in report["findings"]))
+        self.assertEqual(
+            {item["file"] for item in skipped}, {"linked.py", "escaped.py"}
+        )
+        self.assertFalse(
+            any(item["subject"] in {"fcntl", "pwd"} for item in report["findings"])
+        )
 
     def test_skips_symlinked_project_metadata(self) -> None:
         metadata = self.root / "pyproject.toml"
-        self.write("pyproject.toml", '[project]\nname="linked"\nclassifiers=["Operating System :: Microsoft :: Windows"]\n')
+        self.write(
+            "pyproject.toml",
+            '[project]\nname="linked"\nclassifiers=["Operating System :: Microsoft :: Windows"]\n',
+        )
         original = Path.is_symlink
-        with patch.object(Path, "is_symlink", lambda path: path == metadata or original(path)):
+        with patch.object(
+            Path, "is_symlink", lambda path: path == metadata or original(path)
+        ):
             report = scan_project(self.root)
         self.assertEqual(report["summary"]["declared_platforms"], [])
         self.assertIn("CG902", {item["rule_id"] for item in report["findings"]})
 
     def test_skips_symlinked_workflow_directory(self) -> None:
-        self.write(".github/workflows/tests.yml", "jobs:\n  tests:\n    runs-on: windows-latest\n    steps:\n      - run: pytest\n")
+        self.write(
+            ".github/workflows/tests.yml",
+            "jobs:\n  tests:\n    runs-on: windows-latest\n    steps:\n      - run: pytest\n",
+        )
         workflow_dir = self.root / ".github" / "workflows"
         original = Path.is_symlink
-        with patch.object(Path, "is_symlink", lambda path: path == workflow_dir or original(path)):
+        with patch.object(
+            Path, "is_symlink", lambda path: path == workflow_dir or original(path)
+        ):
             report = scan_project(self.root, supported_override=["windows"])
         self.assertEqual(report["summary"]["test_ci_platforms"], [])
         self.assertIn("CG903", {item["rule_id"] for item in report["findings"]})
 
     def test_skips_symlinked_workflow_file(self) -> None:
         workflow = self.root / ".github" / "workflows" / "tests.yml"
-        self.write(".github/workflows/tests.yml", "jobs:\n  tests:\n    runs-on: windows-latest\n    steps:\n      - run: pytest\n")
+        self.write(
+            ".github/workflows/tests.yml",
+            "jobs:\n  tests:\n    runs-on: windows-latest\n    steps:\n      - run: pytest\n",
+        )
         original = Path.is_symlink
-        with patch.object(Path, "is_symlink", lambda path: path == workflow or original(path)):
+        with patch.object(
+            Path, "is_symlink", lambda path: path == workflow or original(path)
+        ):
             report = scan_project(self.root, supported_override=["windows"])
         self.assertEqual(report["summary"]["test_ci_platforms"], [])
-        self.assertTrue(any(item["rule_id"] == "CG903" and item["file"].endswith("tests.yml") for item in report["findings"]))
+        self.assertTrue(
+            any(
+                item["rule_id"] == "CG903" and item["file"].endswith("tests.yml")
+                for item in report["findings"]
+            )
+        )
 
-    def test_skips_out_of_root_metadata_workflow_directory_and_workflow_file(self) -> None:
+    def test_skips_out_of_root_metadata_workflow_directory_and_workflow_file(
+        self,
+    ) -> None:
         original_resolve = Path.resolve
         outside = self.root.parent / "outside-project-input"
 
         metadata_root = self.root / "metadata-case"
         metadata_root.mkdir()
         metadata = metadata_root / "pyproject.toml"
-        metadata.write_text('[project]\nname="external"\nclassifiers=["Operating System :: Microsoft :: Windows"]\n', encoding="utf-8")
-        with patch.object(Path, "resolve", lambda path, strict=False: outside if path == metadata else original_resolve(path, strict=strict)):
+        metadata.write_text(
+            '[project]\nname="external"\nclassifiers=["Operating System :: Microsoft :: Windows"]\n',
+            encoding="utf-8",
+        )
+        with patch.object(
+            Path,
+            "resolve",
+            lambda path, strict=False: (
+                outside if path == metadata else original_resolve(path, strict=strict)
+            ),
+        ):
             metadata_report = scan_project(metadata_root)
         self.assertEqual(metadata_report["summary"]["declared_platforms"], [])
-        self.assertIn("CG902", {item["rule_id"] for item in metadata_report["findings"]})
+        self.assertIn(
+            "CG902", {item["rule_id"] for item in metadata_report["findings"]}
+        )
 
         directory_root = self.root / "workflow-directory-case"
         workflow_dir = directory_root / ".github" / "workflows"
         workflow_dir.mkdir(parents=True)
-        (workflow_dir / "tests.yml").write_text("jobs:\n  tests:\n    runs-on: windows-latest\n    steps:\n      - run: pytest\n", encoding="utf-8")
-        with patch.object(Path, "resolve", lambda path, strict=False: outside if path == workflow_dir else original_resolve(path, strict=strict)):
-            directory_report = scan_project(directory_root, supported_override=["windows"])
+        (workflow_dir / "tests.yml").write_text(
+            "jobs:\n  tests:\n    runs-on: windows-latest\n    steps:\n      - run: pytest\n",
+            encoding="utf-8",
+        )
+        with patch.object(
+            Path,
+            "resolve",
+            lambda path, strict=False: (
+                outside
+                if path == workflow_dir
+                else original_resolve(path, strict=strict)
+            ),
+        ):
+            directory_report = scan_project(
+                directory_root, supported_override=["windows"]
+            )
         self.assertEqual(directory_report["summary"]["test_ci_platforms"], [])
-        self.assertIn("CG903", {item["rule_id"] for item in directory_report["findings"]})
+        self.assertIn(
+            "CG903", {item["rule_id"] for item in directory_report["findings"]}
+        )
 
         file_root = self.root / "workflow-file-case"
         workflow_file = file_root / ".github" / "workflows" / "tests.yml"
         workflow_file.parent.mkdir(parents=True)
-        workflow_file.write_text("jobs:\n  tests:\n    runs-on: windows-latest\n    steps:\n      - run: pytest\n", encoding="utf-8")
-        with patch.object(Path, "resolve", lambda path, strict=False: outside if path == workflow_file else original_resolve(path, strict=strict)):
+        workflow_file.write_text(
+            "jobs:\n  tests:\n    runs-on: windows-latest\n    steps:\n      - run: pytest\n",
+            encoding="utf-8",
+        )
+        with patch.object(
+            Path,
+            "resolve",
+            lambda path, strict=False: (
+                outside
+                if path == workflow_file
+                else original_resolve(path, strict=strict)
+            ),
+        ):
             file_report = scan_project(file_root, supported_override=["windows"])
         self.assertEqual(file_report["summary"]["test_ci_platforms"], [])
         self.assertIn("CG903", {item["rule_id"] for item in file_report["findings"]})
@@ -488,29 +765,46 @@ except ImportError:
     def test_report_outputs_are_escaped_and_sarif_has_locations(self) -> None:
         self.write("source-at-risk.py", 'def danger():\n    open("x")\n')
         report = scan_project(self.root)
-        next(item for item in report["findings"] if item["rule_id"] == "CG201")["file"] = "<source>.py"
+        next(item for item in report["findings"] if item["rule_id"] == "CG201")[
+            "file"
+        ] = "<source>.py"
         html = render_html(report)
         self.assertIn("&lt;source&gt;.py", html)
         self.assertNotIn("<source>.py", html)
         sarif = render_sarif(report)
         self.assertTrue(sarif["runs"][0]["results"])
-        result = next(row for row in sarif["runs"][0]["results"] if row["ruleId"] == "CG201")
-        self.assertEqual(result["locations"][0]["physicalLocation"]["region"]["startLine"], 2)
+        result = next(
+            row for row in sarif["runs"][0]["results"] if row["ruleId"] == "CG201"
+        )
+        self.assertEqual(
+            result["locations"][0]["physicalLocation"]["region"]["startLine"], 2
+        )
 
     def test_cli_writes_html_json_sarif_and_applies_exit_threshold(self) -> None:
         from crossgrid.cli import run
 
-        self.write("pyproject.toml", '[project]\nname="fixture"\nclassifiers=["Operating System :: Microsoft :: Windows"]\n')
-        self.write("src/app.py", 'def read_config():\n    return open("settings.ini")\n')
+        self.write(
+            "pyproject.toml",
+            '[project]\nname="fixture"\nclassifiers=["Operating System :: Microsoft :: Windows"]\n',
+        )
+        self.write(
+            "src/app.py", 'def read_config():\n    return open("settings.ini")\n'
+        )
         html_path = self.root / "report.html"
         json_path = self.root / "report.json"
         sarif_path = self.root / "report.sarif"
         output = StringIO()
         with redirect_stdout(output):
-            code = run(Namespace(
-                root=str(self.root), platform=None, html=str(html_path),
-                json_path=str(json_path), sarif=str(sarif_path), fail_on="warning",
-            ))
+            code = run(
+                Namespace(
+                    root=str(self.root),
+                    platform=None,
+                    html=str(html_path),
+                    json_path=str(json_path),
+                    sarif=str(sarif_path),
+                    fail_on="warning",
+                )
+            )
 
         self.assertEqual(code, 1)
         self.assertIn("CrossGrid:", output.getvalue())
@@ -522,6 +816,123 @@ except ImportError:
         html = html_path.read_text(encoding="utf-8")
         self.assertIn("CrossGrid", html)
         self.assertIn("prefers-color-scheme:dark", html)
+
+    def test_cli_rejects_report_outputs_that_alias_inputs_or_each_other(self) -> None:
+        from crossgrid.cli import run
+
+        metadata = self.root / "pyproject.toml"
+        original_metadata = '[project]\nname="fixture"\n'
+        self.write("pyproject.toml", original_metadata)
+        args = Namespace(
+            root=str(self.root),
+            platform=None,
+            html=None,
+            json_path=str(metadata),
+            sarif=None,
+            fail_on="error",
+        )
+        errors = StringIO()
+        with redirect_stderr(errors):
+            code = run(args)
+        self.assertEqual(code, 2)
+        self.assertIn("scan input", errors.getvalue())
+        self.assertEqual(metadata.read_text(encoding="utf-8"), original_metadata)
+
+        report = self.root / "same-report.json"
+        args.json_path = str(report)
+        args.sarif = str(report)
+        with redirect_stderr(StringIO()):
+            code = run(args)
+        self.assertEqual(code, 2)
+        self.assertFalse(report.exists())
+
+    def test_cli_rejects_git_metadata_and_linked_worktree_outputs(self) -> None:
+        from crossgrid.cli import run
+
+        git_metadata = self.root / ".git"
+        git_metadata.mkdir()
+        target = git_metadata / "refs" / "tags" / "v1.0.0"
+        target.parent.mkdir(parents=True)
+        target.write_text("original ref\n", encoding="utf-8")
+        args = Namespace(
+            root=str(self.root),
+            platform=None,
+            html=str(target),
+            json_path=None,
+            sarif=None,
+            fail_on="error",
+        )
+        with redirect_stderr(StringIO()):
+            self.assertEqual(run(args), 2)
+        self.assertEqual(target.read_text(encoding="utf-8"), "original ref\n")
+
+        linked_root = self.root / "linked-project"
+        linked_root.mkdir()
+        external_admin = self.root / "linked-admin" / "worktrees" / "active"
+        external_admin.mkdir(parents=True)
+        (external_admin / "gitdir").write_text("../worktree/.git\n", encoding="utf-8")
+        common_dir = self.root / "linked-admin"
+        (external_admin / "commondir").write_text("../..\n", encoding="utf-8")
+        (linked_root / ".git").write_text(
+            f"gitdir: {external_admin}\n", encoding="utf-8"
+        )
+        external_ref = external_admin / "refs" / "tags" / "v1.0.0"
+        external_ref.parent.mkdir(parents=True)
+        external_ref.write_text("original linked ref\n", encoding="utf-8")
+        args.root = str(linked_root)
+        args.html = str(external_ref)
+        with redirect_stderr(StringIO()):
+            self.assertEqual(run(args), 2)
+        self.assertEqual(
+            external_ref.read_text(encoding="utf-8"), "original linked ref\n"
+        )
+        self.assertTrue(common_dir.exists())
+
+    def test_cli_rejects_output_under_symlinked_parent(self) -> None:
+        from crossgrid.cli import run
+
+        output_parent = self.root / "reports"
+        output_parent.mkdir()
+        output = output_parent / "report.json"
+        original = Path.is_symlink
+        with patch.object(
+            Path,
+            "is_symlink",
+            lambda path: path == output_parent or original(path),
+        ):
+            args = Namespace(
+                root=str(self.root),
+                platform=None,
+                html=None,
+                json_path=str(output),
+                sarif=None,
+                fail_on="error",
+            )
+            errors = StringIO()
+            with redirect_stderr(errors):
+                self.assertEqual(run(args), 2)
+        self.assertIn("symbolic link", errors.getvalue())
+        self.assertFalse(output.exists())
+
+    def test_cli_returns_a_clean_error_when_root_resolution_fails(self) -> None:
+        from crossgrid.cli import run
+
+        args = Namespace(
+            root=str(self.root),
+            platform=None,
+            html=None,
+            json_path=None,
+            sarif=None,
+            fail_on="error",
+        )
+        errors = StringIO()
+        with (
+            patch.object(Path, "resolve", side_effect=RuntimeError("symlink loop")),
+            redirect_stderr(errors),
+        ):
+            self.assertEqual(run(args), 2)
+        self.assertIn("symlink loop", errors.getvalue())
+        self.assertNotIn("Traceback", errors.getvalue())
 
 
 if __name__ == "__main__":

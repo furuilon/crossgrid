@@ -14,7 +14,7 @@
 - **Core mechanism:** Parse Python source using `ast`, read TOML platform classifiers and YAML workflows, normalize explicit OS labels, and associate evidence without executing project code.
 - **Stack:** Python 3.11+ and PyYAML 6.x.
 - **Data:** In-memory findings contain rule ID, severity, confidence, relative path, line/column, subject, message, and evidence. JSON is the primary structured report.
-- **Safety boundary:** Reads project files only. It does not execute code, tests, workflow commands, plugins, or package installation; it does not modify scanned files. Symlinked and out-of-root Python, metadata, and workflow paths are skipped before reads. It is not a handle-based sandbox against concurrent file replacement.
+- **Safety boundary:** It does not execute code, tests, workflow commands, plugins, or package installation, and it does not overwrite scanned inputs. Symlinked and out-of-root Python, metadata, and workflow paths are skipped before reads. Selected report outputs use atomic replacement and reject input aliases, symlink paths and Git metadata. Input sizes/file counts are bounded. It is not a handle-based sandbox against concurrent file replacement.
 - **MVP output:** Text plus optional JSON, SARIF 2.1.0, and self-contained searchable HTML.
 - **Non-goals:** Proving portability; supporting every CI provider or GitHub expression; evaluating arbitrary skip expressions; reproducing a complete platform-specific API database; modifying source or workflows.
 
@@ -23,8 +23,8 @@
 - Test OS classifiers, explicit matrix runners, runner/name heuristics, skip conditions, and missing-coverage signals.
 - Exercise AST findings for platform imports/APIs, signal constants, encoding, temporary files, and shell calls, including guarded/review cases.
 - Test empty projects, malformed Python/TOML/YAML, report escaping, SARIF source locations, CLI output files, and fail thresholds.
-- Run Windows and Ubuntu CI for Python 3.11–3.13 when available.
-- Keep the project `PARTIAL` until core tests, local installation/entry-point checks, and required docs pass. It is now `READY FOR USER ACCEPTANCE`; the user's comparison against a repository with a known CI matrix is a separate acceptance step.
+- Run Windows, Ubuntu and macOS CI for Python 3.11–3.14 when repository hosting is available; configured matrix entries do not count as passing runs.
+- Keep the project `PARTIAL` until core tests, package build/installation, hosted CI and required docs pass. On 2026-11-16 source tests and Ruff checks pass locally; package installation and hosted CI were not verified in this environment.
 
 ## Risks
 

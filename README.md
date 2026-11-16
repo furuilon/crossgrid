@@ -46,7 +46,7 @@ crossgrid . --platform windows --platform linux
 
 ## 相关工作
 
-[PSASpotter](https://github.com/ricardojob/PSASpotter) 及其[研究论文](https://arxiv.org/abs/2607.17462)使用 AST 分析 Python 平台专属 API，也检查防御性条件。CrossGrid 的源码平台信号与这项先行工作有重叠；本项目不声称首创平台专属 API 分析。CrossGrid 将声明支持的 OS、明确写出的 GitHub Actions runner、简单测试跳过标记和选定源码信号放在一份报告中。这说明的是工作流范围，不代表已证明产品独特或用户需求成立。
+[CrossPortability](https://github.com/neelpatel-png/crossportability) 的公开 README 描述了对 Python 平台专属路径、API/命令、导入和环境变量的 AST 检查；[PSASpotter](https://github.com/ricardojob/PSASpotter) 及其[研究论文](https://arxiv.org/abs/2607.17462)分析平台专属 API 和防护条件。CrossGrid 的源码平台信号与这些先行工作有重叠；本项目不声称首创平台专属 API 分析。CrossGrid 把声明支持的 OS、明确写出的 GitHub Actions runner、简单测试跳过标记和选定源码信号放在一份报告中。这说明的是工作流范围，不代表已证明产品独特或用户需求成立。
 
 ## 输入与限制
 
@@ -56,6 +56,8 @@ crossgrid . --platform windows --platform linux
 - 解析 `pyproject.toml` 的 OS classifiers，包含常见 Poetry metadata。
 - 读取 `.github/workflows/*.yml` 与 `.yaml` 中显式写出的 `runs-on`，以及被 `runs-on` 直接引用的标量 `strategy.matrix.os`/`include[].os`。
 - 识别包含常见系统名称的简单 pytest/unittest 跳过标记。
+- 输入有界：单个 Python 文件最多 8 MiB、Python 总输入最多 128 MiB、最多 20,000 个 Python 文件；单个 workflow 最多 2 MiB、workflow 总输入最多 32 MiB、最多 1,000 个 workflow；`pyproject.toml` 最多 1 MiB。超限文件会以 CG90x finding 说明，避免无界读取。
+- 指定报告会以临时文件原子替换写入；目标必须互不相同，不可指向扫描输入、符号链接路径或 Git 管理目录。已有报告文件可以安全替换。
 
 复杂/派生 YAML 表达式、超过 256 种组合或非标量维度的 matrix、可复用 workflow 的继承、GitLab/CircleCI、自定义 marker 求值、第三方依赖 wheel 兼容性和真实跨 OS 执行均不在当前范围。只有 `runs-on` 是直接的 `${{ matrix.os }}` 或 `${{ matrix['os'] }}` 时才按 matrix 计算 runner，并应用标量 exclude/include。测试任务检测使用完整单词 job/step 名称，或直接调用少数 Python 测试工具（包括 `python -m`、`py -3.x -m`、`env VAR=value`、简单 `coverage run -m`、`uv`/`poetry`/`pipenv run`）。tox/nox 只有在显式选择的环境或 session 名称含 test/unit 标记时才计入；无法解析的默认 tox/nox 运行、list/config 检查命令（包括 `tox config -e ...`）、仅 lint 选择、tox `--notest`/仅打包和 devenv 模式、help/version 和 pytest 仅收集用法均不计入。安装、echo 或仅提及工具也不计入。该命令文本启发式只能提示可能运行了测试，不能证明测试执行或通过。通用 POSIX/Unix 分类器不会被推断成 Linux 或 macOS 声明。`CG201` 识别内置 `open`、`io.open` 与常见 pathlib 打开调用；同名变量有遮蔽、重赋值或模式捕获时会禁用路径推断，任意对象的 `.open()` 不分析。这些规则均是复核线索，不是确定缺陷结论。
 

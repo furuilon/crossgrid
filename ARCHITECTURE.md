@@ -11,7 +11,7 @@ pytest skip markers ─────────────┘
                                text / JSON / SARIF / HTML
 ```
 
-The scanner walks Python source outside common hidden, generated and dependency directories. It builds AST nodes and source locations, then reports a limited set of platform-specific imports/APIs, implicit text encoding, temporary-file review signals and shell invocation.
+The scanner walks Python source outside common hidden, generated and dependency directories. It builds AST nodes and source locations, then reports a limited set of platform-specific imports/APIs, implicit text encoding, temporary-file review signals and shell invocation. Python and workflow reads have per-file and aggregate byte limits plus file-count limits; TOML and Git marker files are also bounded.
 
 The workflow reader only counts an OS as a test runner when the job name or its step text appears test-related and an explicit runner label can be normalized. It recognizes `windows`, `ubuntu/linux`, and `macos` label families. The project scope comes from common OS classifiers or `--platform`; if neither exists, the report says support is undeclared and does not imply all OSes are supported.
 
@@ -34,13 +34,13 @@ Confidence describes the static signal, not whether the code is broken. A nearby
 ## Modules and interfaces
 
 - `src/crossgrid/scanner.py` owns discovery, parsing, normalization, rule evaluation and report rendering. `scan_project(root, supported_override=None) -> dict` is the public scan operation; `report_exit_code(report, fail_on) -> int` applies the configured gate.
-- `src/crossgrid/cli.py` defines `build_parser()`, `run(namespace) -> int`, and `main()`. It writes only caller-selected outputs and converts expected filesystem/scan errors to exit code 2.
+- `src/crossgrid/cli.py` defines `build_parser()`, `run(namespace) -> int`, and `main()`. Report outputs are checked together before writing: input aliases, duplicate targets, symlinked paths and Git administrative metadata are rejected. Each output uses a same-directory temporary file followed by atomic replacement; expected filesystem/scan errors return exit code 2.
 - `src/crossgrid/__init__.py` owns the package version. `tests/test_scanner.py` covers AST, TOML/YAML fixtures, path-boundary behavior, reports, CLI output, and failure thresholds.
 
 ## Filesystem and error boundary
 
 The selected root is resolved once. Python sources, `pyproject.toml`, workflow directories, and workflow files are checked to remain inside the root and are not followed through symlinks. Unsafe source/workflow paths become CG904/CG903 findings; unsafe metadata becomes CG902. Parse/read failures are reported by input type instead of aborting the entire scan when safe to continue. The scanner does not execute scanned code or workflow commands.
 
-Containment is checked before each read, but this is not a handle-based sandbox: a process that can replace files concurrently could race the check (TOCTOU). CrossGrid assumes a stable local tree during scanning.
+Containment is checked before each read and write, but this is not a handle-based sandbox: a process that can replace files concurrently could race the check (TOCTOU). CrossGrid assumes a stable local tree during scanning.
 
 Tests use synthetic local fixtures. They do not prove that every GitHub Actions expression is interpreted, that static risk signals are true defects, or that a real matrix passes on every operating system. The package was installed in a temporary local Windows venv and its installed CLI entry point passed `--help`; PyPI dependency fetching and clean isolated build resolution remain unverified because network access was disabled.
