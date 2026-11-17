@@ -24,7 +24,7 @@
 - Exercise AST findings for platform imports/APIs, signal constants, encoding, temporary files, and shell calls, including guarded/review cases.
 - Test empty projects, malformed Python/TOML/YAML, report escaping, SARIF source locations, CLI output files, and fail thresholds.
 - Run Windows, Ubuntu and macOS CI for Python 3.11–3.14 when repository hosting is available; configured matrix entries do not count as passing runs.
-- Keep the project `PARTIAL` until core tests, package build/installation, hosted CI and required docs pass. On 2026-11-16 source tests and Ruff checks pass locally; package installation and hosted CI were not verified in this environment.
+- Keep the project `PARTIAL` pending hosted CI and human acceptance. On Windows/Python 3.14.2, the wheel/sdist built successfully; the wheel installed in an isolated venv with PyYAML 6.0.3, `pip check`, CLI help/version and all 38 tests passing. Python 3.11.0 source tests also passed. Python 3.12–3.13, macOS/Linux, hosted CI, real repository accuracy review and report viewport acceptance remain unverified.
 
 ## Risks
 

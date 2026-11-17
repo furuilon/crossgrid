@@ -4,6 +4,8 @@ CrossGrid 将 Python 仓库里的四类证据放在一起查看：`pyproject.tom
 
 CrossGrid 做静态分析，不会替你在 Windows、Linux 或 macOS 上运行项目。没有发现问题也不等于已证明可移植。
 
+本机验证环境为 Windows：Python 3.11.0 源码测试、Python 3.14.2 隔离环境（PyYAML 6.0.3）安装后测试均通过；wheel/sdist 构建和 CLI 检查通过。GitHub Actions 的跨系统矩阵已配置但尚未实际运行；项目尚未发布到 PyPI。
+
 English version：[README.en.md](README.en.md) · [项目规格](PROJECT_SPEC.md) · [技术机制](TECHNICAL_INNOVATION.md) · [架构](ARCHITECTURE.md) · [用户验收指南](USER_ACCEPTANCE.md)
 
 ## 安装

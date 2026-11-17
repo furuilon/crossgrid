@@ -4,6 +4,8 @@ CrossGrid connects four kinds of evidence in a Python repository: operating syst
 
 CrossGrid is static analysis. It does not execute your project on Windows, Linux or macOS, and a clean report is not proof of portability.
 
+Local verification used Windows: source tests passed on Python 3.11.0, and tests after isolated Python 3.14.2 installation passed with PyYAML 6.0.3. Wheel/sdist builds and CLI checks passed. The configured cross-platform GitHub Actions matrix has not run yet, and the project is not published to PyPI.
+
 简体中文主页：[README.md](README.md) · [验收指南](USER_ACCEPTANCE.md) · [架构](ARCHITECTURE.md) · [项目规格](PROJECT_SPEC.md) · [技术机制](TECHNICAL_INNOVATION.md)
 
 ## Install
