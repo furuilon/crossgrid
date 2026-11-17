@@ -6,7 +6,7 @@ CrossGrid 做静态分析，不会替你在 Windows、Linux 或 macOS 上运行�
 
 本机验证环境为 Windows：Python 3.11.0 源码测试、Python 3.14.2 隔离环境（PyYAML 6.0.3）安装后测试均通过；wheel/sdist 构建和 CLI 检查通过。GitHub Actions 的跨系统矩阵已配置但尚未实际运行；项目尚未发布到 PyPI。
 
-English version：[README.en.md](README.en.md) · [项目规格](PROJECT_SPEC.md) · [技术机制](TECHNICAL_INNOVATION.md) · [架构](ARCHITECTURE.md) · [用户验收指南](USER_ACCEPTANCE.md)
+English version：[README.en.md](README.en.md) · [项目规格](PROJECT_SPEC.md) · [技术机制](TECHNICAL_INNOVATION.md) · [架构](ARCHITECTURE.md)
 
 ## 安装
 
@@ -74,7 +74,7 @@ python -m unittest discover -s tests -v
 
 ## 文档
 
-[架构说明](ARCHITECTURE.md) · [工作手册](WORK_MANUAL.md) · [自我审查](SELF_REVIEW.md) · [用户验收指南](USER_ACCEPTANCE.md)
+[架构说明](ARCHITECTURE.md) · [技术机制](TECHNICAL_INNOVATION.md) · [贡献指南](CONTRIBUTING.md)
 
 ## 许可证与依赖
 
