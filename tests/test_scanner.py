@@ -911,8 +911,59 @@ except ImportError:
             errors = StringIO()
             with redirect_stderr(errors):
                 self.assertEqual(run(args), 2)
-        self.assertIn("symbolic link", errors.getvalue())
+        self.assertIn("symlink or reparse point", errors.getvalue())
         self.assertFalse(output.exists())
+
+    def test_cli_rejects_output_under_junctioned_parent(self) -> None:
+        from crossgrid.cli import run
+
+        output_parent = self.root / "junction-reports"
+        output_parent.mkdir()
+        output = output_parent / "report.json"
+        is_junction = getattr(Path, "is_junction", None)
+
+        def fake_is_junction(path: Path) -> bool:
+            return path == output_parent or bool(is_junction and is_junction(path))
+
+        args = Namespace(
+            root=str(self.root),
+            platform=None,
+            html=None,
+            json_path=str(output),
+            sarif=None,
+            fail_on="error",
+        )
+        errors = StringIO()
+        with (
+            patch.object(Path, "is_junction", fake_is_junction, create=True),
+            redirect_stderr(errors),
+        ):
+            self.assertEqual(run(args), 2)
+        self.assertIn("symlink or reparse point", errors.getvalue())
+        self.assertFalse(output.exists())
+
+    def test_windows_reparse_attribute_is_detected_without_is_junction_api(
+        self,
+    ) -> None:
+        from types import SimpleNamespace
+
+        from crossgrid import scanner
+
+        candidate = self.root / "junction-reports"
+        original_lstat = Path.lstat
+
+        def fake_lstat(path: Path):
+            if path == candidate:
+                return SimpleNamespace(st_file_attributes=0x400)
+            return original_lstat(path)
+
+        with (
+            patch.object(scanner.os, "name", "nt"),
+            patch.object(Path, "is_symlink", return_value=False),
+            patch.object(Path, "is_junction", return_value=False, create=True),
+            patch.object(Path, "lstat", fake_lstat),
+        ):
+            self.assertTrue(scanner._is_link_or_reparse_point(candidate))
 
     def test_cli_returns_a_clean_error_when_root_resolution_fails(self) -> None:
         from crossgrid.cli import run

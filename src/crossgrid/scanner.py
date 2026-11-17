@@ -7,6 +7,7 @@ import itertools
 import os
 import re
 import shlex
+import stat
 import tempfile
 import tokenize
 import tomllib
@@ -95,6 +96,23 @@ def _read_git_marker(path: Path) -> str:
     if len(contents) > MAX_GIT_MARKER_BYTES:
         raise ValueError("Git metadata marker exceeds the safe size limit.")
     return contents.decode("utf-8").strip()
+
+
+def _is_link_or_reparse_point(path: Path) -> bool:
+    """Detect symlinks and Windows reparse points in paths used for reports."""
+    if path.is_symlink():
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if callable(is_junction) and is_junction():
+        return True
+    if os.name == "nt":
+        try:
+            attributes = path.lstat().st_file_attributes
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        reparse_attribute = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        return bool(attributes & reparse_attribute)
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,9 +213,9 @@ def _validate_report_targets(
                 "A report output path could not be resolved safely."
             ) from exc
         for ancestor in (destination, *destination.parents):
-            if ancestor.is_symlink():
+            if _is_link_or_reparse_point(ancestor):
                 raise ValueError(
-                    f"Report output cannot traverse a symbolic link: {ancestor}"
+                    f"Report output cannot traverse a symlink or reparse point: {ancestor}"
                 )
         if destination.exists() and destination.is_dir():
             raise ValueError(f"Report output path is a directory: {destination}")
