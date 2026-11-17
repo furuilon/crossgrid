@@ -4,7 +4,7 @@ CrossGrid connects four kinds of evidence in a Python repository: operating syst
 
 CrossGrid is static analysis. It does not execute your project on Windows, Linux or macOS, and a clean report is not proof of portability.
 
-Local verification used Windows: source tests passed on Python 3.11.0, and tests after isolated Python 3.14.2 installation passed with PyYAML 6.0.3. Wheel/sdist builds and CLI checks passed. The configured cross-platform GitHub Actions matrix has not run yet, and the project is not published to PyPI.
+Local verification used Windows: all 40 tests in the current source tree passed on Python 3.11.0. An earlier 38-test snapshot passed after isolated installation on Python 3.14.2 with PyYAML 6.0.3; the two Windows reparse-point path regressions added afterwards have not been rerun on Python 3.14.2. The recorded wheel/sdist build and installation checks also predate those regressions, so the current tree has not been rebuilt into a wheel or sdist. The configured cross-platform GitHub Actions matrix has not run yet, and the project is not published to PyPI.
 
 简体中文主页：[README.md](README.md) · [架构](ARCHITECTURE.md) · [项目规格](PROJECT_SPEC.md) · [技术机制](TECHNICAL_INNOVATION.md)
 
@@ -19,10 +19,15 @@ crossgrid --version
 
 ## Quick start
 
-From a Python project root:
+From a Python project root. This PowerShell example writes reports to the system temporary directory so generated files stay out of the scanned project:
 
 ```powershell
-crossgrid . --html crossgrid-report.html --json crossgrid-report.json --sarif crossgrid.sarif
+$reportDir = Join-Path $env:TEMP ('crossgrid-report-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Force -Path $reportDir | Out-Null
+crossgrid . `
+  --html (Join-Path $reportDir 'report.html') `
+  --json (Join-Path $reportDir 'report.json') `
+  --sarif (Join-Path $reportDir 'report.sarif')
 ```
 
 If support classifiers are missing, state the scope explicitly:
@@ -50,11 +55,11 @@ The rules are conservative and incomplete. Every finding includes confidence, so
 
 ## Related work
 
-[CrossPortability](https://github.com/neelpatel-png/crossportability)'s public README describes AST checks for Python OS-specific paths, APIs/commands, imports and environment variables. [PSASpotter](https://github.com/ricardojob/PSASpotter) and its [research paper](https://arxiv.org/abs/2607.17462) analyze platform-specific APIs and defensive guards. CrossGrid overlaps with both prior works in source-level platform signals; it does not claim to introduce platform-specific API analysis. CrossGrid combines declared OS support, explicit GitHub Actions runners, simple test skip markers and selected source signals in one report. This describes its workflow, not proven product uniqueness or validated user demand.
+[CrossPortability](https://github.com/neelpatel-png/crossportability)'s public README describes AST checks for Python OS-specific paths, APIs/commands, imports and environment variables. [PSASpotter](https://github.com/ricardojob/PSASpotter) and its [research paper](https://arxiv.org/abs/2607.17462) analyze platform-specific APIs and defensive guards. CrossGrid combines declared OS support, explicit GitHub Actions runners, simple test skip markers and selected source signals in one report.
 
 ### Rule sources and curation
 
-The platform-specific module, API and constant lists are maintainer-curated from Python’s public standard-library documentation. This is a provenance statement, not a guarantee produced by the similarity scan. The checked source tree contains no imported external rule database or vendored linter implementation. A project-level Git history begins with an initial snapshot commit on 2026-11-16; it does not establish authorship history before that date, and no internet-wide code scan was run. Sources include [`os`](https://docs.python.org/3.11/library/os.html), [`signal`](https://docs.python.org/3.11/library/signal.html), [`platform`](https://docs.python.org/3.11/library/platform.html), and the platform-specific [`pwd`](https://docs.python.org/3.11/library/pwd.html), [`grp`](https://docs.python.org/3.11/library/grp.html), [`fcntl`](https://docs.python.org/3.11/library/fcntl.html), [`termios`](https://docs.python.org/3.11/library/termios.html), [`resource`](https://docs.python.org/3.11/library/resource.html), [`pty`](https://docs.python.org/3.11/library/pty.html), and Windows-only [`winreg`](https://docs.python.org/3.11/library/winreg.html) module references. These links establish documented API/platform facts; the selected subset and matching logic are this project’s rule design and remain intentionally incomplete.
+The Python official standard-library pages below document platform restrictions for the listed APIs; the scanner uses a limited subset and does not bundle an external rule database or vendored linter implementation. The selected rules and matching logic do not provide complete compatibility analysis. Sources include [`os`](https://docs.python.org/3.11/library/os.html), [`signal`](https://docs.python.org/3.11/library/signal.html), [`platform`](https://docs.python.org/3.11/library/platform.html), and the platform-specific [`pwd`](https://docs.python.org/3.11/library/pwd.html), [`grp`](https://docs.python.org/3.11/library/grp.html), [`fcntl`](https://docs.python.org/3.11/library/fcntl.html), [`termios`](https://docs.python.org/3.11/library/termios.html), [`resource`](https://docs.python.org/3.11/library/resource.html), [`pty`](https://docs.python.org/3.11/library/pty.html), and Windows-only [`winreg`](https://docs.python.org/3.11/library/winreg.html) module references.
 
 ## Inputs and limits
 
@@ -64,9 +69,20 @@ The platform-specific module, API and constant lists are maintainer-curated from
 - `.github/workflows/*.yml` and `.yaml` with explicit `runs-on`, or scalar `strategy.matrix.os`/`include[].os` values referenced directly by `runs-on`.
 - Simple pytest/unittest platform skip markers that contain recognizable OS names.
 - Bounded inputs: each Python file up to 8 MiB, 128 MiB total Python source and 20,000 Python files; each workflow up to 2 MiB, 32 MiB total workflow data and 1,000 workflow files; `pyproject.toml` up to 1 MiB. Oversized inputs produce CG90x findings instead of unbounded reads.
-- Selected reports are written by atomic replacement. Output targets must be distinct and cannot point to scan inputs, symbolic-link paths or Git administrative metadata. Existing report files may be replaced safely.
+- Selected reports are written by atomic replacement. Output targets must be distinct and cannot point to scan inputs, symbolic links, Windows junction/reparse-point paths, or Git administrative metadata. Existing report files may be replaced safely.
 
-Derived YAML expressions, matrices exceeding 256 combinations or using non-scalar dimensions, reusable workflow inheritance, GitLab/CircleCI, custom marker evaluation, third-party dependency wheel support and actual OS execution are not analyzed. Matrix values count only when `runs-on` is the direct `${{ matrix.os }}` or `${{ matrix['os'] }}` expression; scalar exclusions and includes are applied. Test-job detection uses whole-word job/step labels and recognizes direct invocations of a short list of Python test tools (including `python -m`, `py -3.x -m`, `env VAR=value`, simple `coverage run -m`, and `uv`/`poetry`/`pipenv` wrappers); tox/nox count only when an explicitly selected environment or session name contains a test/unit marker. Opaque default tox/nox runs, list/config inspection commands (including `tox config -e ...`), lint-only selections, tox `--notest`/package-only and devenv modes, help/version modes, and pytest collection-only mode do not count, nor do install/echo/mention commands. This command-text heuristic is evidence of likely test execution, not proof tests passed. Generic POSIX/Unix package classifiers are not treated as Linux or macOS declarations. `CG201`, `CG202` and `CG301` are review signals, not automatic defect claims; CG201 recognizes built-in, `io.open`, and common pathlib open calls. Path-variable inference is disabled when same-named bindings are shadowed, reassigned, or captured by structural patterns, and arbitrary `.open()` methods are not analyzed.
+### Workflow and runner scope
+
+- Derived or complex YAML expressions, reusable workflow inheritance, GitLab/CircleCI, custom marker evaluation, third-party dependency wheel support, and actual execution on other operating systems are outside the current scope.
+- Matrix runners are counted only when `runs-on` directly uses `${{ matrix.os }}` or `${{ matrix['os'] }}`; scalar `exclude` and `include` are applied. Matrices with more than 256 combinations or non-scalar dimensions are not analyzed.
+- Test jobs are inferred from whole-word job/step labels or recognized direct invocations such as `python -m`, `py -3.x -m`, `env VAR=value`, simple `coverage run -m`, and `uv`/`poetry`/`pipenv run`. `tox`/`nox` count only when an explicitly selected environment or session name contains a `test`/`unit` marker.
+- Opaque default `tox`/`nox` runs, list/config inspection (including `tox config -e ...`), lint-only selections, `tox --notest`/package-only, devenv, help/version, pytest collection-only, install, echo, and mere mentions of test tools do not count. Command-text heuristics suggest that tests may run; they do not prove that tests ran or passed.
+- Generic POSIX/Unix classifiers are not treated as Linux or macOS support declarations.
+
+### Source-rule limits
+
+- `CG201` recognizes built-in `open`, `io.open`, and common `pathlib.Path.open` calls. Path inference is disabled for shadowed, reassigned, or pattern-captured bindings; arbitrary `.open()` methods are not analyzed.
+- `CG201`, `CG202`, and `CG301` are review prompts, not definitive defect claims. Rules can miss cases or produce false positives.
 
 Exit codes: default `--fail-on error` returns `0` for this tool's warning/review signals and `2` for an input or output error. Choose `--fail-on warning` or `--fail-on review` if your team wants a stricter CI gate.
 
@@ -81,4 +97,4 @@ python -m unittest discover -s tests -v
 
 MIT. See [LICENSE](LICENSE).
 
-CrossGrid depends on PyYAML (`>=6.0,<7`), which is separately installed and is released under the MIT license. See the [upstream license notice](https://github.com/yaml/pyyaml/blob/main/README.md#license). CrossGrid does not vendor PyYAML source.
+CrossGrid depends on PyYAML (`>=6.0,<7`), which is separately installed. The PyYAML 6.0.3 version used in verification is released under the MIT license; see its [upstream license file](https://github.com/yaml/pyyaml/blob/6.0.3/LICENSE). CrossGrid does not vendor PyYAML source.
