@@ -6,7 +6,7 @@ CrossGrid 将 Python 仓库里的四类证据放在一起查看：`pyproject.tom
 
 CrossGrid 做静态分析，不会替你在 Windows、Linux 或 macOS 上运行项目。没有发现问题也不等于已证明可移植。
 
-本机验证环境为 Windows：当前源码树的 40 项测试在 Python 3.11.0 全部通过。GitHub Actions run [#1](https://github.com/furuilon/crossgrid/actions/runs/44198425891) 对提交 `33717f6b328325e343469723242a033787c7b483` 的 12/12 组合全部通过：Ubuntu/macOS/Windows × Python 3.11–3.14；每个任务均成功完成包安装、CLI 冒烟、`pip check` 和 40 项自动化测试，包括 Windows reparse-point 回归用例。独立的 sdist 构建/检查仍未完成；项目尚未发布到 PyPI。自动化测试通过不代表扫描结果已在各种真实仓库中验证，也不代表报告页面已在浏览器中检查。
+本机验证环境为 Windows：当前源码树的 40 项测试在 Python 3.11.0 全部通过。GitHub Actions run [#2](https://github.com/furuilon/crossgrid/actions/runs/44207813048) 在文档修改的基线提交 `ece8383cf04e734c93051dd247830f3fdb81c2d8` 上通过 12/12 组合：Ubuntu/macOS/Windows × Python 3.11–3.14；每个任务均完成包安装、CLI 冒烟、`pip check` 和 40 项自动化测试，包括模拟 Windows junction/reparse 元数据的回归用例。本次文档修改尚未由新的 Actions run 验证。更早的 run [#1](https://github.com/furuilon/crossgrid/actions/runs/44198425891) 也在提交 `33717f6b328325e343469723242a033787c7b483` 上通过。独立的 sdist 构建/检查仍未完成；项目尚未发布到 PyPI。自动化测试通过不代表扫描结果已在各种真实仓库中验证，也不代表报告页面已在浏览器中检查。
 
 English version：[README.en.md](README.en.md) · [项目规格](PROJECT_SPEC.md) · [技术机制](TECHNICAL_INNOVATION.md) · [架构](ARCHITECTURE.md)
 
