@@ -1,10 +1,12 @@
 # CrossGrid
 
+[![GitHub Actions Tests](https://github.com/furuilon/crossgrid/actions/workflows/tests.yml/badge.svg?branch=main&event=push)](https://github.com/furuilon/crossgrid/actions/workflows/tests.yml)
+
 CrossGrid connects four kinds of evidence in a Python repository: operating systems declared in `pyproject.toml`, explicit GitHub Actions test runners, simple platform-related test skips, and a small set of source-level portability signals. Its report answers a narrow question: **does the repository's stated OS scope have visible test-runner evidence, and where should a maintainer review assumptions?**
 
 CrossGrid is static analysis. It does not execute your project on Windows, Linux or macOS, and a clean report is not proof of portability.
 
-Local verification used Windows: all 40 tests in the current source tree passed on Python 3.11.0. An earlier 38-test snapshot passed after isolated installation on Python 3.14.2 with PyYAML 6.0.3; the two Windows reparse-point path regressions added afterwards have not been rerun on Python 3.14.2. The recorded wheel/sdist build and installation checks also predate those regressions, so the current tree has not been rebuilt into a wheel or sdist. The configured cross-platform GitHub Actions matrix has not run yet, and the project is not published to PyPI.
+Local verification used Windows: all 40 tests in the current source tree passed on Python 3.11.0. GitHub Actions run [#1](https://github.com/furuilon/crossgrid/actions/runs/44198425891) passed all 12 combinations for commit `33717f6b328325e343469723242a033787c7b483`: Ubuntu/macOS/Windows × Python 3.11–3.14. Each job completed package installation, CLI smoke checks, `pip check`, and all 40 automated tests, including the Windows reparse-point regressions. A standalone sdist build and inspection remain unverified, and the project is not published to PyPI. Passing the automated test suite does not establish scanner accuracy on every real repository, and the report has not been visually inspected in a browser.
 
 简体中文主页：[README.md](README.md) · [架构](ARCHITECTURE.md) · [项目规格](PROJECT_SPEC.md) · [技术机制](TECHNICAL_INNOVATION.md)
 

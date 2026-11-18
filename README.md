@@ -1,10 +1,12 @@
 # CrossGrid
 
+[![GitHub Actions Tests](https://github.com/furuilon/crossgrid/actions/workflows/tests.yml/badge.svg?branch=main&event=push)](https://github.com/furuilon/crossgrid/actions/workflows/tests.yml)
+
 CrossGrid 将 Python 仓库里的四类证据放在一起查看：`pyproject.toml` 声明的操作系统、GitHub Actions 明确写出的测试 runner、简单的平台相关测试跳过条件，以及少量源码可移植性线索。报告回答一个有限问题：**仓库声明支持的系统是否有可见的测试 runner 证据，哪些代码假设值得维护者检查？**
 
 CrossGrid 做静态分析，不会替你在 Windows、Linux 或 macOS 上运行项目。没有发现问题也不等于已证明可移植。
 
-本机验证环境为 Windows：当前源码树的 40 项测试在 Python 3.11.0 全部通过。此前 38 项测试在 Python 3.14.2 隔离安装环境（PyYAML 6.0.3）通过；随后新增的两项 Windows reparse-point 路径回归尚未在 Python 3.14.2 重跑。wheel/sdist 构建及安装检查是在这两项回归加入前完成的，当前代码尚未重新构建 wheel/sdist。GitHub Actions 的跨系统矩阵已配置但尚未实际运行；项目尚未发布到 PyPI。
+本机验证环境为 Windows：当前源码树的 40 项测试在 Python 3.11.0 全部通过。GitHub Actions run [#1](https://github.com/furuilon/crossgrid/actions/runs/44198425891) 对提交 `33717f6b328325e343469723242a033787c7b483` 的 12/12 组合全部通过：Ubuntu/macOS/Windows × Python 3.11–3.14；每个任务均成功完成包安装、CLI 冒烟、`pip check` 和 40 项自动化测试，包括 Windows reparse-point 回归用例。独立的 sdist 构建/检查仍未完成；项目尚未发布到 PyPI。自动化测试通过不代表扫描结果已在各种真实仓库中验证，也不代表报告页面已在浏览器中检查。
 
 English version：[README.en.md](README.en.md) · [项目规格](PROJECT_SPEC.md) · [技术机制](TECHNICAL_INNOVATION.md) · [架构](ARCHITECTURE.md)
 

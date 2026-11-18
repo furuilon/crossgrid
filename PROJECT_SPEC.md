@@ -23,8 +23,8 @@
 - Test OS classifiers, explicit matrix runners, runner/name heuristics, skip conditions, and missing-coverage signals.
 - Exercise AST findings for platform imports/APIs, signal constants, encoding, temporary files, and shell calls, including guarded/review cases.
 - Test empty projects, malformed Python/TOML/YAML, report escaping, SARIF source locations, CLI output files, and fail thresholds.
-- Run Windows, Ubuntu and macOS CI for Python 3.11–3.14 when repository hosting is available; configured matrix entries do not count as passing runs.
-- Keep the project `PARTIAL` pending hosted CI and human acceptance. On Windows/Python 3.14.2, the wheel/sdist built successfully; the wheel installed in an isolated venv with PyYAML 6.0.3, `pip check`, CLI help/version and all 38 tests then present passing. After adding Windows junction/reparse output-path regressions, all 40 source-tree tests passed on Windows/Python 3.11.0; the two added tests have not been rerun on Python 3.14.2. Python 3.12–3.13, macOS/Linux, hosted CI, real repository accuracy review and report viewport acceptance remain unverified.
+- GitHub Actions run [#1](https://github.com/furuilon/crossgrid/actions/runs/44198425891) passed all 12 Windows/Ubuntu/macOS × Python 3.11–3.14 jobs on commit `33717f6b328325e343469723242a033787c7b483`. Each job installed the current project, passed CLI and `pip check` steps, and ran all 40 tests. The matrix is actual hosted evidence; a separately built and inspected sdist is still unverified.
+- The current source tree also passed 40 tests on Windows/Python 3.11.0. Earlier local wheel/sdist inspection covered a 38-test snapshot; the hosted `pip install .` jobs exercised package builds/install across the current matrix but did not produce or inspect a release sdist. The project is not published to PyPI. Automated tests do not establish the scanner's accuracy on every real repository, and the generated report has not been visually inspected in a browser.
 
 ## Risks
 
