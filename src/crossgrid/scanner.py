@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import configparser
 import heapq
 import io
 import itertools
@@ -17,6 +18,8 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
+from . import __version__
 
 
 SKIP_DIRS = {
@@ -70,6 +73,10 @@ SKIP_MARKERS = (
     "posix",
 )
 MAX_METADATA_BYTES = 1024 * 1024
+MAX_SETUP_CFG_EXPANDED_BYTES = 1024 * 1024
+MAX_SETUP_CFG_INTERPOLATION_DEPTH = 10
+MAX_SETUP_CFG_INTERPOLATION_REFERENCES = 4096
+MAX_SETUP_CFG_INTERPOLATION_SCAN_CHARS = 4 * 1024 * 1024
 MAX_WORKFLOW_BYTES = 2 * 1024 * 1024
 MAX_WORKFLOW_FILES = 1_000
 MAX_TOTAL_WORKFLOW_BYTES = 32 * 1024 * 1024
@@ -131,20 +138,106 @@ class Finding:
 
 def _safe_project_path(root: Path, path: Path) -> bool:
     """Allow reads only through non-symlink paths that resolve inside the scan root."""
+    return _safe_project_candidate_path(root, path, strict=True)
+
+
+def _safe_project_candidate_path(
+    root: Path, path: Path, *, strict: bool = False
+) -> bool:
+    """Check an existing input or a not-yet-created in-root input path."""
     try:
-        resolved = path.resolve(strict=True)
+        resolved = path.resolve(strict=strict)
     except (OSError, RuntimeError):
         return False
     if not resolved.is_relative_to(root):
         return False
     current = path
     while current != root:
-        if current.is_symlink():
+        if _is_link_or_reparse_point(current):
             return False
         current = current.parent
         if not current.is_relative_to(root) and current != root:
             return False
     return True
+
+
+_SETUP_CFG_INTERPOLATION_KEY = re.compile(r"%\(([^)]+)\)s")
+
+
+def _expand_setup_cfg_interpolation(
+    metadata: configparser.ConfigParser,
+    section: str,
+    option: str,
+    value: str,
+    *,
+    depth: int = 0,
+    active: frozenset[tuple[str, str]] = frozenset(),
+    references: list[int] | None = None,
+    scanned_chars: list[int] | None = None,
+) -> str:
+    """Expand ConfigParser references within output, depth, and work limits."""
+    if references is None:
+        references = [0]
+    if scanned_chars is None:
+        scanned_chars = [0]
+    scanned_chars[0] += len(value)
+    if scanned_chars[0] > MAX_SETUP_CFG_INTERPOLATION_SCAN_CHARS:
+        raise ValueError("setup.cfg interpolation scans too much text")
+    if depth > MAX_SETUP_CFG_INTERPOLATION_DEPTH:
+        raise ValueError("setup.cfg interpolation is too deeply nested")
+    key = (section, metadata.optionxform(option))
+    if key in active:
+        raise ValueError("setup.cfg interpolation contains a cycle")
+    active = active | {key}
+
+    parts: list[str] = []
+    output_bytes = 0
+
+    def append(part: str) -> None:
+        nonlocal output_bytes
+        output_bytes += len(part.encode("utf-8"))
+        if output_bytes > MAX_SETUP_CFG_EXPANDED_BYTES:
+            raise ValueError("expanded setup.cfg metadata exceeds the safe size limit")
+        parts.append(part)
+
+    index = 0
+    literal_start = 0
+    while index < len(value):
+        if value[index] != "%":
+            index += 1
+            continue
+        append(value[literal_start:index])
+        if index + 1 < len(value) and value[index + 1] == "%":
+            append("%")
+            index += 2
+            literal_start = index
+            continue
+        match = _SETUP_CFG_INTERPOLATION_KEY.match(value, index)
+        if match is None:
+            raise ValueError("setup.cfg interpolation has invalid syntax")
+        references[0] += 1
+        if references[0] > MAX_SETUP_CFG_INTERPOLATION_REFERENCES:
+            raise ValueError("setup.cfg interpolation has too many references")
+        reference = metadata.optionxform(match.group(1))
+        reference_key = (section, reference)
+        if reference_key in active:
+            raise ValueError("setup.cfg interpolation contains a cycle")
+        raw_reference = metadata.get(section, reference, raw=True)
+        expanded_reference = _expand_setup_cfg_interpolation(
+            metadata,
+            section,
+            reference,
+            raw_reference,
+            depth=depth + 1,
+            active=active,
+            references=references,
+            scanned_chars=scanned_chars,
+        )
+        append(expanded_reference)
+        index = match.end()
+        literal_start = index
+    append(value[literal_start:])
+    return "".join(parts)
 
 
 def _git_metadata_roots(root: Path) -> set[Path]:
@@ -350,14 +443,128 @@ def _platforms_from_classifiers(classifiers: list[str]) -> set[str]:
     return result
 
 
+def _read_setup_cfg_platforms(
+    root: Path, input_paths: list[Path] | None = None
+) -> tuple[set[str], list[Finding]]:
+    path = root / "setup.cfg"
+    if not (path.exists() or path.is_symlink()):
+        return set(), []
+    if not _safe_project_path(root, path):
+        return set(), [
+            Finding(
+                "CG902",
+                "warning",
+                "high",
+                "setup.cfg",
+                1,
+                1,
+                "metadata path",
+                "Project metadata symlink or path escape was skipped.",
+                "CrossGrid reads only non-symlink files inside the selected project root.",
+            )
+        ]
+    try:
+        if not path.is_file():
+            raise ValueError("setup.cfg is not a regular file")
+        content = _read_limited_bytes(path, MAX_METADATA_BYTES).decode("utf-8")
+        metadata = configparser.ConfigParser(interpolation=None, strict=True)
+        metadata.read_string(content)
+        if metadata.has_option("metadata", "classifiers"):
+            option = "classifiers"
+        elif metadata.has_option("metadata", "classifier"):
+            option = "classifier"
+        else:
+            return set(), []
+        classifiers_text = metadata.get("metadata", option, raw=True)
+        classifiers_text = _expand_setup_cfg_interpolation(
+            metadata, "metadata", option, classifiers_text
+        )
+        classifier_lines = [
+            line.strip() for line in classifiers_text.splitlines() if line.strip()
+        ]
+        file_lines = [
+            line for line in classifier_lines if line.lower().startswith("file:")
+        ]
+        if file_lines:
+            if len(file_lines) != len(classifier_lines):
+                raise ValueError(
+                    "file references cannot be mixed with inline classifiers"
+                )
+            if len(file_lines) > 16:
+                raise ValueError("too many classifier file references")
+            referenced_text: list[str] = []
+            total_bytes = 0
+            for line in file_lines:
+                filenames = [name.strip() for name in line[5:].split(",")]
+                if not filenames or any(not name for name in filenames):
+                    raise ValueError("classifier file reference is empty")
+                if len(filenames) + len(referenced_text) > 16:
+                    raise ValueError("too many classifier file references")
+                for filename in filenames:
+                    if (
+                        Path(filename).is_absolute()
+                        or filename.startswith(("\\\\", "//"))
+                        or (len(filename) >= 2 and filename[1] == ":")
+                    ):
+                        raise ValueError("classifier file must use a relative path")
+                    source = root / filename
+                    if not _safe_project_candidate_path(root, source):
+                        raise ValueError("classifier file path is unsafe")
+                    if input_paths is not None:
+                        input_paths.append(source)
+                    if not _safe_project_path(root, source) or not source.is_file():
+                        raise ValueError(
+                            "classifier file is not a regular in-root file"
+                        )
+                    file_content = _read_limited_bytes(source, MAX_METADATA_BYTES)
+                    total_bytes += len(file_content)
+                    if total_bytes > MAX_METADATA_BYTES:
+                        raise _InputTooLarge
+                    referenced_text.append(file_content.decode("utf-8"))
+            classifiers_text = "\n".join(referenced_text)
+    except (
+        OSError,
+        UnicodeError,
+        configparser.Error,
+        RecursionError,
+        _InputTooLarge,
+        ValueError,
+    ) as exc:
+        return set(), [
+            Finding(
+                "CG902",
+                "warning",
+                "high",
+                "setup.cfg",
+                1,
+                1,
+                "metadata",
+                f"Could not read project classifiers: {exc.__class__.__name__}.",
+                "Setuptools declarative metadata could not be parsed.",
+            )
+        ]
+    classifiers = [
+        value.strip()
+        for line in classifiers_text.splitlines()
+        for value in line.split(",")
+        if value.strip()
+    ]
+    return _platforms_from_classifiers(classifiers), []
+
+
 def _read_project_platforms(
     root: Path, input_paths: list[Path] | None = None
 ) -> tuple[set[str], list[Finding]]:
     path = root / "pyproject.toml"
     if input_paths is not None and (path.exists() or path.is_symlink()):
         input_paths.append(path)
+    setup_cfg_path = root / "setup.cfg"
+    if input_paths is not None and (
+        setup_cfg_path.exists() or setup_cfg_path.is_symlink()
+    ):
+        input_paths.append(setup_cfg_path)
     if not path.exists():
-        return set(), []
+        return _read_setup_cfg_platforms(root, input_paths)
     if not _safe_project_path(root, path):
         return set(), [
             Finding(
@@ -427,7 +634,57 @@ def _read_project_platforms(
                 "Expected [tool.poetry] to be a TOML table.",
             )
         ]
-    classifiers = project.get("classifiers", []) or poetry.get("classifiers", [])
+    dynamic = project.get("dynamic", [])
+    if not isinstance(dynamic, list) or not all(
+        isinstance(value, str) for value in dynamic
+    ):
+        return set(), [
+            Finding(
+                "CG902",
+                "warning",
+                "high",
+                "pyproject.toml",
+                1,
+                1,
+                "dynamic metadata",
+                "Project dynamic metadata must be a TOML string array.",
+                "Dynamic project metadata could not be used to infer platform scope.",
+            )
+        ]
+    if "classifiers" in project and "classifiers" in dynamic:
+        return set(), [
+            Finding(
+                "CG902",
+                "warning",
+                "high",
+                "pyproject.toml",
+                1,
+                1,
+                "classifiers",
+                "Project classifiers cannot be both static and dynamic.",
+                "The conflicting metadata declaration could not be used to infer platform scope.",
+            )
+        ]
+    if "classifiers" in project:
+        classifiers = project["classifiers"]
+    elif "classifiers" in dynamic:
+        return set(), [
+            Finding(
+                "CG902",
+                "warning",
+                "high",
+                "pyproject.toml",
+                1,
+                1,
+                "dynamic classifiers",
+                "Dynamic project classifiers are not evaluated.",
+                "CrossGrid does not execute build metadata providers.",
+            )
+        ]
+    elif "classifiers" in poetry:
+        classifiers = poetry["classifiers"]
+    else:
+        return _read_setup_cfg_platforms(root, input_paths)
     if not isinstance(classifiers, list):
         return set(), [
             Finding(
@@ -1694,7 +1951,7 @@ def render_sarif(report: dict) -> dict:
                 "tool": {
                     "driver": {
                         "name": "CrossGrid",
-                        "version": "0.1.0",
+                        "version": __version__,
                         "rules": [{"id": rule_id} for rule_id in rule_ids],
                     }
                 },

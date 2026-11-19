@@ -3,7 +3,7 @@
 ## Evidence flow
 
 ```text
-pyproject classifiers ──────────┐
+pyproject / setup.cfg classifiers ┐
 GitHub Actions explicit runners ├─ normalize OS labels ─ support coverage rows
 Python AST risk signals ─────────┤
 pytest skip markers ─────────────┘
@@ -13,7 +13,7 @@ pytest skip markers ─────────────┘
 
 The scanner walks Python source outside common hidden, generated and dependency directories. It builds AST nodes and source locations, then reports a limited set of platform-specific imports/APIs, implicit text encoding, temporary-file review signals and shell invocation. Python and workflow reads have per-file and aggregate byte limits plus file-count limits; TOML and Git marker files are also bounded.
 
-The workflow reader only counts an OS as a test runner when the job name or its step text appears test-related and an explicit runner label can be normalized. It recognizes `windows`, `ubuntu/linux`, and `macos` label families. Scalar OS matrices are expanded only when the runner directly references `matrix.os`; combinations are capped at 256. An over-limit, unsupported, or unrecognized-OS matrix emits `CG906` and leaves affected coverage unknown, so an incomplete parse does not become a missing-runner claim. The project scope comes from common OS classifiers or `--platform`; if neither exists, the report says support is undeclared and does not imply all OSes are supported.
+The workflow reader only counts an OS as a test runner when the job name or its step text appears test-related and an explicit runner label can be normalized. It recognizes `windows`, `ubuntu/linux`, and `macos` label families. Scalar OS matrices are expanded only when the runner directly references `matrix.os`; combinations are capped at 256. An over-limit, unsupported, or unrecognized-OS matrix emits `CG906` and leaves affected coverage unknown, so an incomplete parse does not become a missing-runner claim. The project scope comes from static `[project].classifiers`, common Poetry classifiers, or setuptools `[metadata] classifiers` / `classifier` in `setup.cfg`, with `--platform` as a user override. Static PEP 621 classifiers take precedence; dynamic classifiers are reported as unresolved and never executed. Setuptools comma lists, bounded interpolation and `file:` references are read statically. The setup file and expanded value are each limited to 1 MiB; interpolation is limited to 10 nested levels, 4,096 references and 4 Mi characters processed across recursive expansions. At most 16 regular, in-root, non-symlink reference files are read, with a 1 MiB per-file and aggregate limit. Declared in-root reference paths remain protected as report outputs even if the files are missing. If no usable declaration exists, the report says support is undeclared and does not imply all OSes are supported.
 
 ## Confidence model
 
@@ -39,7 +39,7 @@ Confidence describes the static signal, not whether the code is broken. A nearby
 
 ## Filesystem and error boundary
 
-The selected root is resolved once. Python sources, `pyproject.toml`, workflow directories, and workflow files are checked to remain inside the root and are not followed through symlinks. Unsafe source/workflow paths become CG904/CG903 findings; unsafe metadata becomes CG902. Parse/read failures are reported by input type instead of aborting the entire scan when safe to continue. The scanner does not execute scanned code or workflow commands. Output targets refuse existing files by default; `--overwrite` is required to replace one and never bypasses scan-input or Git metadata checks.
+The selected root is resolved once. Python sources, `pyproject.toml`, `setup.cfg`, workflow directories, and workflow files are checked to remain inside the root and are not followed through symlinks. Metadata references must be regular files; unresolved in-root `file:` targets are registered as inputs so report output cannot create them. Unsafe source/workflow paths become CG904/CG903 findings; unsafe metadata becomes CG902. Parse/read failures are reported by input type instead of aborting the entire scan when safe to continue. The scanner does not execute scanned code or workflow commands. Output targets refuse existing files by default; `--overwrite` is required to replace one and never bypasses scan-input or Git metadata checks.
 
 Containment is checked before each read and write, but this is not a handle-based sandbox: a process that can replace files concurrently could race the check (TOCTOU). CrossGrid assumes a stable local tree during scanning.
 

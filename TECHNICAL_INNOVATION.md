@@ -10,7 +10,7 @@ Maintainers inspect classifiers and workflow jobs separately, then search for pl
 
 ## CrossGrid method
 
-1. Parse `pyproject.toml` classifiers and normalize known Windows/Linux/macOS claims.
+1. Parse static PEP 621/Poetry classifiers, with a setuptools `setup.cfg` fallback that bounds raw metadata, interpolation output/depth/reference count/scanned text and in-root regular-file references, then normalize known Windows/Linux/macOS claims. Do not execute dynamic metadata providers.
 2. Parse explicit `.github/workflows/*.yml` runner labels and common `strategy.matrix.os` forms. Expand only supported scalar dimensions within the 256-combination bound; emit CG906 and mark coverage unknown when the matrix cannot be analyzed safely or runner labels cannot be mapped.
 3. Treat a job as test-like only when job/step names or commands match a small set of test-runner tokens; label this evidence as heuristic.
 4. Parse Python files with `ast`, preserving path and source location for selected portability signals.
@@ -20,7 +20,7 @@ Maintainers inspect classifiers and workflow jobs separately, then search for pl
 
 ## Hard parts and code locations
 
-- TOML classifiers and OS normalization: `src/crossgrid/scanner.py` (`_read_project_platforms`, `_platforms_from_classifiers`).
+- TOML/INI classifiers and OS normalization: `src/crossgrid/scanner.py` (`_read_project_platforms`, `_read_setup_cfg_platforms`, `_platforms_from_classifiers`).
 - Workflow and matrix parsing: `_scan_workflows`, `_runner_values`, `_platforms_from_runner`.
 - AST rule locations and guard review classification: `_scan_python` and AST helpers.
 - Coverage join and summary construction: `scan_project`.

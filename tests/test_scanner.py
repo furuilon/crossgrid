@@ -9,7 +9,14 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
-from crossgrid.scanner import report_exit_code, render_html, render_sarif, scan_project
+from crossgrid import __version__
+from crossgrid.scanner import (
+    MAX_METADATA_BYTES,
+    report_exit_code,
+    render_html,
+    render_sarif,
+    scan_project,
+)
 
 
 class CrossGridTests(unittest.TestCase):
@@ -382,6 +389,314 @@ jobs:
         report = scan_project(self.root)
         self.assertEqual(report["summary"]["declared_platforms"], [])
         self.assertEqual(report["platforms"], [])
+
+    def test_reads_multiline_setuptools_setup_cfg_classifiers(self) -> None:
+        self.write(
+            "setup.cfg",
+            """
+[metadata]
+classifiers =
+    Operating System :: Microsoft :: Windows
+    Operating System :: POSIX :: Linux
+    Programming Language :: Python :: 3
+""",
+        )
+        report = scan_project(self.root)
+        self.assertEqual(report["summary"]["declared_platforms"], ["linux", "windows"])
+
+    def test_reads_comma_list_legacy_classifier_alias_and_interpolation(self) -> None:
+        self.write(
+            "setup.cfg",
+            """
+[metadata]
+windows_classifier = Operating System :: Microsoft :: Windows
+classifier = %(windows_classifier)s, Operating System :: MacOS
+""",
+        )
+        report = scan_project(self.root)
+        self.assertEqual(report["summary"]["declared_platforms"], ["macos", "windows"])
+
+    def test_setup_cfg_interpolation_output_is_bounded(self) -> None:
+        self.write(
+            "setup.cfg",
+            """
+[metadata]
+base = 0123456789012345678901234567890123456789
+amplified = %(base)s%(base)s
+classifiers = %(amplified)s
+""",
+        )
+        with patch("crossgrid.scanner.MAX_SETUP_CFG_EXPANDED_BYTES", 64):
+            report = scan_project(self.root)
+        self.assertEqual(report["summary"]["declared_platforms"], [])
+        self.assertTrue(
+            any(
+                finding["rule_id"] == "CG902" and finding["file"] == "setup.cfg"
+                for finding in report["findings"]
+            )
+        )
+
+    def test_setup_cfg_empty_interpolation_work_is_bounded(self) -> None:
+        empty_references = "".join("%(empty)s" for _ in range(16))
+        nested_references = "".join("%(level1)s" for _ in range(16))
+        self.write(
+            "setup.cfg",
+            f"""
+[metadata]
+empty =
+level1 = {empty_references}
+level2 = {nested_references}
+classifiers = %(level2)s
+""",
+        )
+        with patch("crossgrid.scanner.MAX_SETUP_CFG_INTERPOLATION_REFERENCES", 20):
+            report = scan_project(self.root)
+        self.assertEqual(report["summary"]["declared_platforms"], [])
+        self.assertTrue(
+            any(
+                finding["rule_id"] == "CG902" and finding["file"] == "setup.cfg"
+                for finding in report["findings"]
+            )
+        )
+
+    def test_setup_cfg_interpolation_text_scan_is_bounded(self) -> None:
+        long_key = "k" * 120
+        classifier_refs = "".join("%(leaf)s" for _ in range(5))
+        self.write(
+            "setup.cfg",
+            f"""
+[metadata]
+{long_key} =
+leaf = %({long_key})s
+classifiers = {classifier_refs}
+""",
+        )
+        with patch("crossgrid.scanner.MAX_SETUP_CFG_INTERPOLATION_SCAN_CHARS", 256):
+            report = scan_project(self.root)
+        self.assertEqual(report["summary"]["declared_platforms"], [])
+        self.assertTrue(
+            any(
+                finding["rule_id"] == "CG902" and finding["file"] == "setup.cfg"
+                for finding in report["findings"]
+            )
+        )
+
+    def test_reads_bounded_in_root_setup_cfg_classifier_file(self) -> None:
+        self.write(
+            "setup.cfg",
+            "[metadata]\nclassifiers = file: windows.txt, linux.txt\n",
+        )
+        self.write("windows.txt", "Operating System :: Microsoft :: Windows\n")
+        self.write("linux.txt", "Operating System :: POSIX :: Linux\n")
+        report = scan_project(self.root)
+        self.assertEqual(report["summary"]["declared_platforms"], ["linux", "windows"])
+
+    def test_skips_symlinked_setup_cfg_classifier_file(self) -> None:
+        self.write(
+            "setup.cfg",
+            "[metadata]\nclassifiers = file: classifiers.txt\n",
+        )
+        self.write("classifiers.txt", "Operating System :: Microsoft :: Windows\n")
+        source = self.root / "classifiers.txt"
+        original = Path.is_symlink
+        with patch.object(
+            Path, "is_symlink", lambda path: path == source or original(path)
+        ):
+            report = scan_project(self.root)
+        self.assertEqual(report["summary"]["declared_platforms"], [])
+        self.assertTrue(
+            any(
+                finding["rule_id"] == "CG902" and finding["file"] == "setup.cfg"
+                for finding in report["findings"]
+            )
+        )
+
+    def test_setup_cfg_classifier_file_is_an_output_protected_input(self) -> None:
+        from crossgrid.cli import run
+
+        self.write(
+            "setup.cfg",
+            "[metadata]\nclassifiers = file: classifiers.txt\n",
+        )
+        content = "Operating System :: Microsoft :: Windows\n"
+        self.write("classifiers.txt", content)
+        source = self.root / "classifiers.txt"
+        args = Namespace(
+            root=str(self.root),
+            platform=[],
+            html=None,
+            json_path=str(source),
+            sarif=None,
+            overwrite=True,
+            fail_on="none",
+        )
+        errors = StringIO()
+        with redirect_stderr(errors):
+            code = run(args)
+        self.assertEqual(code, 2)
+        self.assertIn("scan input", errors.getvalue())
+        self.assertEqual(source.read_text(encoding="utf-8"), content)
+
+    def test_missing_setup_cfg_classifier_file_is_an_output_protected_input(
+        self,
+    ) -> None:
+        from crossgrid.cli import run
+
+        self.write(
+            "setup.cfg",
+            "[metadata]\nclassifiers = file: classifiers.txt\n",
+        )
+        source = self.root / "classifiers.txt"
+        args = Namespace(
+            root=str(self.root),
+            platform=[],
+            html=None,
+            json_path=str(source),
+            sarif=None,
+            overwrite=True,
+            fail_on="none",
+        )
+        errors = StringIO()
+        with redirect_stderr(errors):
+            code = run(args)
+        self.assertEqual(code, 2)
+        self.assertIn("scan input", errors.getvalue())
+        self.assertFalse(source.exists())
+
+    def test_refuses_non_regular_setup_cfg_classifier_file(self) -> None:
+        self.write(
+            "setup.cfg",
+            "[metadata]\nclassifiers = file: classifiers.txt\n",
+        )
+        source = self.root / "classifiers.txt"
+        self.write("classifiers.txt", "Operating System :: Microsoft :: Windows\n")
+        original = Path.is_file
+        with patch.object(
+            Path, "is_file", lambda path: False if path == source else original(path)
+        ):
+            report = scan_project(self.root)
+        self.assertEqual(report["summary"]["declared_platforms"], [])
+        self.assertTrue(
+            any(
+                finding["rule_id"] == "CG902" and finding["file"] == "setup.cfg"
+                for finding in report["findings"]
+            )
+        )
+
+    def test_setup_cfg_classifier_file_outside_root_is_unresolved(self) -> None:
+        self.write(
+            "setup.cfg",
+            "[metadata]\nclassifiers = file: ../classifiers.txt\n",
+        )
+        report = scan_project(self.root)
+        self.assertTrue(
+            any(
+                finding["rule_id"] == "CG902" and finding["file"] == "setup.cfg"
+                for finding in report["findings"]
+            )
+        )
+
+    def test_static_pyproject_classifiers_take_precedence_over_setup_cfg(self) -> None:
+        self.write(
+            "pyproject.toml",
+            '[project]\nname="fixture"\nclassifiers=[]\n',
+        )
+        self.write(
+            "setup.cfg",
+            "[metadata]\nclassifiers =\n    Operating System :: Microsoft :: Windows\n",
+        )
+        report = scan_project(self.root)
+        self.assertEqual(report["summary"]["declared_platforms"], [])
+
+    def test_poetry_classifiers_take_precedence_over_setup_cfg(self) -> None:
+        self.write(
+            "pyproject.toml",
+            '[tool.poetry]\nname="fixture"\nclassifiers=["Operating System :: MacOS"]\n',
+        )
+        self.write(
+            "setup.cfg",
+            "[metadata]\nclassifiers =\n    Operating System :: Microsoft :: Windows\n",
+        )
+        report = scan_project(self.root)
+        self.assertEqual(report["summary"]["declared_platforms"], ["macos"])
+
+    def test_dynamic_pyproject_classifiers_are_not_read_from_setup_cfg(self) -> None:
+        self.write(
+            "pyproject.toml",
+            '[project]\nname="fixture"\ndynamic=["classifiers"]\n',
+        )
+        self.write(
+            "setup.cfg",
+            "[metadata]\nclassifiers =\n    Operating System :: Microsoft :: Windows\n",
+        )
+        report = scan_project(self.root)
+        self.assertEqual(report["summary"]["declared_platforms"], [])
+        self.assertTrue(
+            any(
+                finding["rule_id"] == "CG902"
+                and finding["subject"] == "dynamic classifiers"
+                for finding in report["findings"]
+            )
+        )
+
+    def test_malformed_and_oversized_setup_cfg_are_reported(self) -> None:
+        oversized = "x" * (MAX_METADATA_BYTES + 1)
+        for content in (
+            "[metadata\nclassifiers = Operating System :: Microsoft :: Windows\n",
+            oversized,
+        ):
+            with self.subTest(size=len(content)):
+                self.write("setup.cfg", content)
+                report = scan_project(self.root)
+                self.assertTrue(
+                    any(
+                        finding["rule_id"] == "CG902" and finding["file"] == "setup.cfg"
+                        for finding in report["findings"]
+                    )
+                )
+
+    def test_skips_symlinked_setup_cfg(self) -> None:
+        setup_cfg = self.root / "setup.cfg"
+        self.write(
+            "setup.cfg",
+            "[metadata]\nclassifiers =\n    Operating System :: Microsoft :: Windows\n",
+        )
+        original = Path.is_symlink
+        with patch.object(
+            Path, "is_symlink", lambda path: path == setup_cfg or original(path)
+        ):
+            report = scan_project(self.root)
+        self.assertEqual(report["summary"]["declared_platforms"], [])
+        self.assertTrue(
+            any(
+                finding["rule_id"] == "CG902" and finding["file"] == "setup.cfg"
+                for finding in report["findings"]
+            )
+        )
+
+    def test_skips_out_of_root_setup_cfg(self) -> None:
+        setup_cfg = self.root / "setup.cfg"
+        self.write(
+            "setup.cfg",
+            "[metadata]\nclassifiers =\n    Operating System :: Microsoft :: Windows\n",
+        )
+        original_resolve = Path.resolve
+        outside = self.root.parent / "outside-setup.cfg"
+        with patch.object(
+            Path,
+            "resolve",
+            lambda path, strict=False: (
+                outside if path == setup_cfg else original_resolve(path, strict=strict)
+            ),
+        ):
+            report = scan_project(self.root)
+        self.assertEqual(report["summary"]["declared_platforms"], [])
+        self.assertTrue(
+            any(
+                finding["rule_id"] == "CG902" and finding["file"] == "setup.cfg"
+                for finding in report["findings"]
+            )
+        )
 
     def test_valid_toml_with_non_table_project_or_tool_is_reported_not_crashed(
         self,
@@ -922,6 +1237,7 @@ except ImportError:
         self.assertTrue(any(item["rule_id"] == "CG201" for item in findings))
         sarif = json.loads(sarif_path.read_text(encoding="utf-8"))
         self.assertEqual(sarif["version"], "2.1.0")
+        self.assertEqual(sarif["runs"][0]["tool"]["driver"]["version"], __version__)
         self.assertIn("CG201", {item["ruleId"] for item in sarif["runs"][0]["results"]})
         html = html_path.read_text(encoding="utf-8")
         self.assertIn("CrossGrid", html)
@@ -947,6 +1263,21 @@ except ImportError:
         self.assertEqual(code, 2)
         self.assertIn("scan input", errors.getvalue())
         self.assertEqual(metadata.read_text(encoding="utf-8"), original_metadata)
+
+        setup_cfg = self.root / "setup.cfg"
+        original_setup_cfg = (
+            "[metadata]\nclassifiers =\n    Operating System :: Microsoft :: Windows\n"
+        )
+        self.write("setup.cfg", original_setup_cfg)
+        args.json_path = str(setup_cfg)
+        args.sarif = None
+        args.overwrite = True
+        errors = StringIO()
+        with redirect_stderr(errors):
+            code = run(args)
+        self.assertEqual(code, 2)
+        self.assertIn("scan input", errors.getvalue())
+        self.assertEqual(setup_cfg.read_text(encoding="utf-8"), original_setup_cfg)
 
         report = self.root / "same-report.json"
         args.json_path = str(report)

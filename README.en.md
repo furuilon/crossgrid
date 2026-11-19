@@ -2,13 +2,15 @@
 
 [![GitHub Actions Tests](https://github.com/furuilon/crossgrid/actions/workflows/tests.yml/badge.svg?branch=main&event=push)](https://github.com/furuilon/crossgrid/actions/workflows/tests.yml)
 
-CrossGrid connects four kinds of evidence in a Python repository: operating systems declared in `pyproject.toml`, explicit GitHub Actions test runners, simple platform-related test skips, and a small set of source-level portability signals. Its report answers a narrow question: **does the repository's stated OS scope have visible test-runner evidence, and where should a maintainer review assumptions?**
+CrossGrid connects four kinds of evidence in a Python repository: operating systems declared in `pyproject.toml` or `setup.cfg`, explicit GitHub Actions test runners, simple platform-related test skips, and a small set of source-level portability signals. Its report answers a narrow question: **does the repository's stated OS scope have visible test-runner evidence, and where should a maintainer review assumptions?**
 
 CrossGrid is static analysis. It does not execute your project on Windows, Linux or macOS, and a clean report is not proof of portability.
 
 The hosted workflow runs Python 3.11–3.14 tests on Windows, macOS and Ubuntu. Check the [Actions page](https://github.com/furuilon/crossgrid/actions/workflows/tests.yml) for results associated with a specific commit. The current sdist has not been independently inspected, and the project is not published to PyPI. Automated tests do not establish scanner accuracy on every real repository; generated reports have not been reviewed in a browser viewport.
 
-简体中文主页：[README.md](README.md) · [架构](ARCHITECTURE.md) · [项目规格](PROJECT_SPEC.md) · [技术机制](TECHNICAL_INNOVATION.md)
+The current package version is a **0.2.0 development snapshot** and is not published to PyPI. SARIF reports read the tool version from the package version.
+
+简体中文主页：[README.md](README.md) · [架构](ARCHITECTURE.md) · [项目规格](PROJECT_SPEC.md) · [技术机制](TECHNICAL_INNOVATION.md) · [Changelog](CHANGELOG.md)
 
 ## Install
 
@@ -32,13 +34,13 @@ crossgrid . `
   --sarif (Join-Path $reportDir 'report.sarif')
 ```
 
-If support classifiers are missing, state the scope explicitly:
+CrossGrid prefers static `[project].classifiers`. If the field is absent and no dynamic classifiers are declared, it checks `[tool.poetry].classifiers`, then falls back to setuptools `[metadata] classifiers` or the legacy `classifier` alias in `setup.cfg`. It supports multiline values, comma lists, ConfigParser interpolation and bounded `file:` references. Dynamic classifiers and build scripts are never executed. If none of these sources provides a usable declaration, state the scope explicitly:
 
 ```powershell
 crossgrid . --platform windows --platform linux
 ```
 
-The report shows declared targets and test-like `runs-on` evidence separately. It also lists simple `pytest.mark.skipif` platform conditions and source locations.
+`setup.cfg` and each classifier file reference are limited to 1 MiB; referenced files have a combined 1 MiB limit and a maximum of 16 files. Interpolation output is capped at 1 MiB, 10 nested levels and 4,096 references, with at most 4 Mi characters processed across recursive expansions. References must be regular, non-symlink files inside the selected root. Unsafe, missing, non-regular or oversized references produce `CG902`. A missing in-root reference remains protected as an output path, so a report cannot become classifier input on a later scan. The report shows declared targets and test-like `runs-on` evidence separately. It also lists simple `pytest.mark.skipif` platform conditions and source locations.
 
 Existing report paths are refused by default. Add `--overwrite` only after checking the destination; it never bypasses scan-input, duplicate-path or Git-metadata guards.
 
@@ -53,28 +55,30 @@ Existing report paths are refused by default. Add `--overwrite` only after check
 | CG301 | `os.system()` or subprocess `shell=True` to review for shell differences |
 | CG801 | A simple platform-related `skipif`/`skipUnless` marker |
 | CG901 | Declared target OS has no recognized explicit test-like Actions runner |
-| CG902–905 | Workflow, metadata or source file could not be analyzed |
+| CG902–905 | Workflow, metadata or source file could not be analyzed; dynamic classifiers are reported as unresolved and build scripts are not executed |
 | CG906 | Runner matrix exceeds the analysis scope or contains OS labels that cannot be mapped; affected coverage is unknown rather than a confirmed missing runner |
 
 The rules are conservative and incomplete. Every finding includes confidence, source location and the evidence used.
 
 ## Related work
 
-[CrossPortability](https://github.com/neelpatel-png/crossportability)'s public README describes AST checks for Python OS-specific paths, APIs/commands, imports and environment variables. [PSASpotter](https://github.com/ricardojob/PSASpotter) and its [research paper](https://arxiv.org/abs/2607.17462) analyze platform-specific APIs and defensive guards. CrossGrid combines declared OS support, explicit GitHub Actions runners, simple test skip markers and selected source signals in one report.
+[CrossPortability](https://github.com/neelpatel-png/crossportability)'s public README describes AST checks for Python OS-specific paths, APIs/commands, imports and environment variables. [PSASpotter](https://github.com/ricardojob/PSASpotter) and its [research paper](https://arxiv.org/abs/2607.17462) analyze platform-specific APIs and defensive guards. The [PyCrossCheck PyPI page](https://pypi.org/project/pycrosscheck/) also advertises Windows/Linux/macOS compatibility checks, 56+ rules, CLI/JSON output and a Bandit plugin; this is direct overlap in static source analysis. Its listed GitHub source URL is a placeholder and currently returns 404, so this records its public claims without validating implementation or rule coverage. CrossGrid focuses on reporting the consistency between declared OS support and explicit GitHub Actions test runners, with simple skip markers and limited source signals; it does not claim to be the only or most complete compatibility checker.
 
 ### Rule sources and curation
 
 The Python official standard-library pages below document platform restrictions for the listed APIs; the scanner uses a limited subset and does not bundle an external rule database or vendored linter implementation. The selected rules and matching logic do not provide complete compatibility analysis. Sources include [`os`](https://docs.python.org/3.11/library/os.html), [`signal`](https://docs.python.org/3.11/library/signal.html), [`platform`](https://docs.python.org/3.11/library/platform.html), and the platform-specific [`pwd`](https://docs.python.org/3.11/library/pwd.html), [`grp`](https://docs.python.org/3.11/library/grp.html), [`fcntl`](https://docs.python.org/3.11/library/fcntl.html), [`termios`](https://docs.python.org/3.11/library/termios.html), [`resource`](https://docs.python.org/3.11/library/resource.html), [`pty`](https://docs.python.org/3.11/library/pty.html), and Windows-only [`winreg`](https://docs.python.org/3.11/library/winreg.html) module references.
+
+Static `setup.cfg` reading follows setuptools' [declarative configuration documentation](https://setuptools.pypa.io/en/stable/userguide/declarative_config.html), which documents multiline and comma-list `[metadata] classifiers`, the `classifier` compatibility alias, interpolation and `file:` references. CrossGrid reads those files but never executes build metadata code.
 
 ## Inputs and limits
 
 - Python source files; hidden and common generated/dependency directories are skipped.
 - Symlinked source, metadata and workflow paths are not followed; resolved inputs must stay inside the selected project root.
 - CrossGrid is not a security sandbox and assumes that another process does not replace project files during a scan. A race can occur between path checks and file reads or writes.
-- `pyproject.toml` OS classifiers, including common Poetry metadata.
+- Static OS classifiers in `pyproject.toml` (PEP 621 and common Poetry metadata); when absent, setuptools `[metadata] classifiers` or the legacy `classifier` alias from `setup.cfg` are used, including comma lists, interpolation and bounded `file:` references. Dynamic classifiers are not evaluated.
 - `.github/workflows/*.yml` and `.yaml` with explicit `runs-on`, or scalar `strategy.matrix.os`/`include[].os` values referenced directly by `runs-on`.
 - Simple pytest/unittest platform skip markers that contain recognizable OS names.
-- Bounded inputs: each Python file up to 8 MiB, 128 MiB total Python source and 20,000 Python files; each workflow up to 2 MiB, 32 MiB total workflow data and 1,000 workflow files; `pyproject.toml` up to 1 MiB. Oversized inputs produce CG90x findings instead of unbounded reads.
+- Bounded inputs: each Python file up to 8 MiB, 128 MiB total Python source and 20,000 Python files; each workflow up to 2 MiB, 32 MiB total workflow data and 1,000 workflow files; `pyproject.toml`, `setup.cfg` and each `file:` classifier source up to 1 MiB, interpolation output up to 1 MiB/10 levels/4,096 references, at most 4 Mi characters processed recursively, and a 1 MiB/16-file aggregate classifier-reference limit. Oversized inputs produce CG90x findings instead of unbounded reads.
 - Output targets must be distinct and cannot overwrite scan inputs, symbolic links, Windows junction/reparse-point paths, or Git administrative metadata. Existing files are refused unless `--overwrite` is supplied after review. New files are created without clobbering; replacement uses a same-directory temporary file and atomic replace. If the filesystem does not support hard links, exclusive creation plus copying is used; an interrupted or failed copy may leave a partial new report but will not replace an existing target.
 
 ### Workflow and runner scope
