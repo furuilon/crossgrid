@@ -42,6 +42,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--sarif", help="write a SARIF 2.1.0 report")
     parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="replace existing report files after checking for scan-input conflicts",
+    )
+    parser.add_argument(
         "--fail-on",
         choices=("none", "review", "warning", "error"),
         default="error",
@@ -59,13 +64,21 @@ def _text(report: dict) -> str:
         "",
         "Platform coverage:",
     ]
+    if summary.get("test_ci_unknown"):
+        lines.append(
+            "Some test-runner matrices were not analyzed; affected OS coverage is unknown (CG906)."
+        )
     if report["platforms"]:
         for row in report["platforms"]:
-            status = (
-                "test runner found"
-                if row["test_ci_present"]
-                else "no test runner found"
+            coverage = row.get(
+                "test_ci_status",
+                "covered" if row["test_ci_present"] else "missing",
             )
+            status = {
+                "covered": "test runner found",
+                "missing": "no test runner found",
+                "unknown": "coverage unknown; matrix not analyzed",
+            }[coverage]
             lines.append(
                 f"  {row['platform']:8} {status}; {row['platform_skip_count']} platform-related skip marker(s)"
             )
@@ -111,9 +124,14 @@ def run(args: argparse.Namespace) -> int:
             root,
             [args.html, args.json_path, args.sarif],
             input_paths,
+            overwrite=bool(getattr(args, "overwrite", False)),
         )
         for destination, content in zip(outputs, report_contents, strict=True):
-            _write_report(destination, content)
+            _write_report(
+                destination,
+                content,
+                overwrite=bool(getattr(args, "overwrite", False)),
+            )
         print(_text(report))
         if args.html:
             print(f"HTML report: {args.html}")

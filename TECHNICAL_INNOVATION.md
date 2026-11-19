@@ -11,11 +11,11 @@ Maintainers inspect classifiers and workflow jobs separately, then search for pl
 ## CrossGrid method
 
 1. Parse `pyproject.toml` classifiers and normalize known Windows/Linux/macOS claims.
-2. Parse explicit `.github/workflows/*.yml` runner labels and common `strategy.matrix.os` forms.
+2. Parse explicit `.github/workflows/*.yml` runner labels and common `strategy.matrix.os` forms. Expand only supported scalar dimensions within the 256-combination bound; emit CG906 and mark coverage unknown when the matrix cannot be analyzed safely or runner labels cannot be mapped.
 3. Treat a job as test-like only when job/step names or commands match a small set of test-runner tokens; label this evidence as heuristic.
 4. Parse Python files with `ast`, preserving path and source location for selected portability signals.
 5. Recognize simple platform-related test skip markers from source text and report their locations rather than evaluating the expressions.
-6. Join the three evidence layers into one per-platform coverage table; preserve missing/unknown states and confidence labels.
+6. Join the three evidence layers into one per-platform coverage table; preserve covered, missing and unknown states and confidence labels.
 7. Emit text, JSON, SARIF, and escaped HTML without executing the scanned project.
 
 ## Hard parts and code locations
@@ -30,7 +30,7 @@ The advance is primarily integration and traceability: each signal is intentiona
 
 ## Correctness evidence
 
-`tests/test_scanner.py` uses synthetic Python projects with TOML/YAML/source fixtures. It tests matrix extraction, missing runner evidence, platform and import guards, encoding and shell signals, malformed input handling, report escaping, SARIF line locations, CLI output files, and warning exit thresholds.
+`tests/test_scanner.py` uses synthetic Python projects with TOML/YAML/source fixtures. It tests matrix extraction and over-limit unknown coverage, missing runner evidence, platform and import guards, encoding and shell signals, malformed input handling, report escaping, SARIF line locations, no-clobber and explicit-overwrite output behavior, and warning exit thresholds.
 
 ## Performance
 
@@ -38,7 +38,7 @@ Scanning is one directory walk plus per-file AST parsing; workflow and metadata 
 
 ## Limitations and next technical work
 
-- Test-job and OS matching are heuristics. Dynamic matrix expressions, reusable workflows and external CI systems can be missed.
+- Test-job and OS matching are heuristics. Dynamic matrix expressions, reusable workflows and external CI systems can be missed. Matrices over 256 combinations, unsupported shapes, or unrecognized OS labels remain unknown rather than being treated as missing coverage.
 - Guard context is not full control-flow proof; the rule set can have false positives and false negatives.
 - Symlinked or out-of-root sources, metadata, and workflow paths are skipped to keep reads inside the selected root.
 - Containment is checked before opening a path, not through a pinned file handle; a malicious process concurrently replacing files could create a TOCTOU race. The tool is a local review aid, not a security sandbox.

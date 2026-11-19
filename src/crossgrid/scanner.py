@@ -7,6 +7,7 @@ import itertools
 import os
 import re
 import shlex
+import shutil
 import stat
 import tempfile
 import tokenize
@@ -199,7 +200,11 @@ def _same_path(first: Path, second: Path) -> bool:
 
 
 def _validate_report_targets(
-    root: Path, outputs: list[str | None], input_paths: list[Path]
+    root: Path,
+    outputs: list[str | None],
+    input_paths: list[Path],
+    *,
+    overwrite: bool = False,
 ) -> list[Path]:
     destinations = [Path(output).expanduser() for output in outputs if output]
     metadata_roots = _git_metadata_roots(root)
@@ -247,6 +252,19 @@ def _validate_report_targets(
             raise ValueError(
                 f"Report output cannot overwrite a scan input: {destination}"
             )
+        try:
+            os.lstat(destination)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise ValueError(
+                "A report output path could not be checked safely."
+            ) from exc
+        else:
+            if not overwrite:
+                raise ValueError(
+                    "Report output already exists; pass --overwrite to replace it."
+                )
 
     for index, destination in enumerate(destinations):
         if any(_same_path(destination, other) for other in destinations[index + 1 :]):
@@ -254,7 +272,7 @@ def _validate_report_targets(
     return destinations
 
 
-def _write_report(path: Path, content: str) -> None:
+def _write_report(path: Path, content: str, *, overwrite: bool = False) -> None:
     temporary_name: str | None = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -264,7 +282,36 @@ def _write_report(path: Path, content: str) -> None:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
             stream.write(content)
             stream.flush()
-        os.replace(temporary_name, path)
+        if overwrite:
+            os.replace(temporary_name, path)
+        else:
+            try:
+                os.link(temporary_name, path)
+            except FileExistsError as exc:
+                raise ValueError(
+                    "Report output already exists; pass --overwrite to replace it."
+                ) from exc
+            except OSError:
+                # Fall back on an exclusive create for filesystems that do not
+                # support hard links. This prevents clobbering, though an
+                # interruption during the copy can leave a partial new file.
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                flags |= getattr(os, "O_BINARY", 0)
+                try:
+                    output_fd = os.open(path, flags, 0o600)
+                except FileExistsError as exc:
+                    raise ValueError(
+                        "Report output already exists; pass --overwrite to replace it."
+                    ) from exc
+                with (
+                    os.fdopen(output_fd, "wb") as output_stream,
+                    open(temporary_name, "rb") as source_stream,
+                ):
+                    shutil.copyfileobj(source_stream, output_stream)
+                    output_stream.flush()
+                    os.fsync(output_stream.fileno())
+    except ValueError:
+        raise
     except OSError as exc:
         raise ValueError(f"Could not write report output file: {path}") from exc
     finally:
@@ -581,9 +628,9 @@ def _runs_on_uses_matrix_os(value: Any) -> bool:
     return any(pattern.search(item) for item in _runner_values(value))
 
 
-def _matrix_os_values(matrix: Any) -> list[str]:
+def _matrix_os_values(matrix: Any) -> tuple[list[str], str | None]:
     if not isinstance(matrix, dict):
-        return []
+        return [], "matrix is not a mapping"
     dimensions: dict[str, list[Any]] = {}
     for key, values in matrix.items():
         if key in {"include", "exclude"}:
@@ -591,14 +638,14 @@ def _matrix_os_values(matrix: Any) -> list[str]:
         if not isinstance(values, list) or any(
             not isinstance(value, (str, int, float, bool)) for value in values
         ):
-            return []
+            return [], f"matrix dimension {key!r} is not a scalar list"
         dimensions[str(key)] = values
 
     combinations_count = 1
     for values in dimensions.values():
         combinations_count *= len(values)
         if combinations_count > 256:
-            return []
+            return [], "matrix exceeds the 256-combination analysis limit"
     keys = list(dimensions)
     combinations = (
         [
@@ -636,7 +683,9 @@ def _matrix_os_values(matrix: Any) -> list[str]:
             if isinstance(entry, dict)
             and isinstance(entry.get("os"), (str, int, float, bool))
         )
-    return values
+    if not values:
+        return [], "matrix.os has no values after supported include/exclude handling"
+    return values, None
 
 
 def _scan_workflows(
@@ -775,8 +824,9 @@ def _scan_workflows(
             strategy = job.get("strategy", {})
             matrix = strategy.get("matrix", {}) if isinstance(strategy, dict) else {}
             runs_on = job.get("runs-on")
+            matrix_unknown_reason = None
             if _runs_on_uses_matrix_os(runs_on):
-                raw_values = _matrix_os_values(matrix)
+                raw_values, matrix_unknown_reason = _matrix_os_values(matrix)
             else:
                 raw_values = [
                     value for value in _runner_values(runs_on) if "${{" not in value
@@ -788,14 +838,61 @@ def _scan_workflows(
                 if unique
                 else set()
             )
+            if (
+                _runs_on_uses_matrix_os(runs_on)
+                and matrix_unknown_reason is None
+                and any(not _platforms_from_runner(value) for value in unique)
+            ):
+                matrix_unknown_reason = (
+                    "matrix.os contains runner labels that do not map to a supported OS"
+                )
             if not unique:
+                if matrix_unknown_reason:
+                    findings.append(
+                        Finding(
+                            "CG906",
+                            "warning",
+                            "medium",
+                            relative,
+                            1,
+                            1,
+                            str(job_id),
+                            "The matrix runner could not be mapped to explicit OS labels.",
+                            matrix_unknown_reason,
+                        )
+                    )
+                    runners.append(
+                        {
+                            "workflow": relative,
+                            "job": str(job_id),
+                            "test_evidence": test_job,
+                            "runners": [],
+                            "platforms": [],
+                            "unknown_platforms": True,
+                        }
+                    )
                 continue
+            if matrix_unknown_reason:
+                findings.append(
+                    Finding(
+                        "CG906",
+                        "warning",
+                        "medium",
+                        relative,
+                        1,
+                        1,
+                        str(job_id),
+                        "The matrix runner could not be mapped to explicit OS labels.",
+                        matrix_unknown_reason,
+                    )
+                )
             runner = {
                 "workflow": relative,
                 "job": str(job_id),
                 "test_evidence": test_job,
                 "runners": unique,
                 "platforms": platforms,
+                "unknown_platforms": bool(matrix_unknown_reason),
             }
             runners.append(runner)
             if test_job:
@@ -1388,6 +1485,9 @@ def scan_project(
     declared, metadata_findings = _read_project_platforms(root, _input_paths)
     runners, ci_platforms, workflow_findings = _scan_workflows(root, _input_paths)
     target_platforms = set(supported_override) if supported_override else declared
+    has_unknown_test_matrix = any(
+        row.get("unknown_platforms") and row["test_evidence"] for row in runners
+    )
     scope_source = (
         "command-line override"
         if supported_override
@@ -1427,7 +1527,7 @@ def scan_project(
                 "Other CI providers and dynamically inherited workflows are not analyzed.",
             )
         )
-    elif not ci_platforms:
+    elif not ci_platforms and not has_unknown_test_matrix:
         findings.append(
             Finding(
                 "CG902",
@@ -1466,12 +1566,21 @@ def scan_project(
             if runner["test_evidence"] and platform in runner["platforms"]
         ]
         skipped_tests = [row for row in skips if platform in row["platforms"]]
+        unknown_jobs = [
+            f"{runner['workflow']} · {runner['job']}"
+            for runner in runners
+            if runner.get("unknown_platforms") and runner["test_evidence"]
+        ]
+        coverage_status = (
+            "covered" if matches else "unknown" if unknown_jobs else "missing"
+        )
         platform_rows.append(
             {
                 "platform": platform,
                 "declared": platform in declared,
                 "in_scope": platform in target_platforms,
                 "test_ci_present": bool(matches),
+                "test_ci_status": coverage_status,
                 "test_jobs": [
                     {
                         "workflow": row["workflow"],
@@ -1480,11 +1589,12 @@ def scan_project(
                     }
                     for row in matches
                 ],
+                "unknown_test_jobs": unknown_jobs,
                 "platform_skip_count": len(skipped_tests),
                 "platform_skips": skipped_tests,
             }
         )
-        if not matches:
+        if coverage_status == "missing":
             findings.append(
                 Finding(
                     "CG901",
@@ -1508,6 +1618,7 @@ def scan_project(
         "notes": sum(item.severity == "note" for item in findings),
         "declared_platforms": sorted(declared),
         "test_ci_platforms": sorted(ci_platforms),
+        "test_ci_unknown": has_unknown_test_matrix,
     }
     return {
         "schema_version": 1,
@@ -1522,6 +1633,7 @@ def scan_project(
         "limits": [
             "Static heuristics do not prove portability or replace real OS test execution.",
             "Only explicit GitHub Actions runner and simple Python marker patterns are counted.",
+            "Oversized or non-scalar matrix runners are marked unknown; they do not produce per-OS missing-runner findings.",
             "Dynamic imports, shell expansion, reusable workflow inheritance, third-party CI, and package wheel availability may be missed.",
             "An explicit encoding or nearby platform guard can still be incorrect.",
         ],
@@ -1617,19 +1729,26 @@ def render_html(report: dict) -> str:
     )
     platform_cards = []
     for row in report["platforms"]:
+        coverage_status = row.get(
+            "test_ci_status",
+            "covered" if row["test_ci_present"] else "missing",
+        )
+        coverage_labels = {
+            "covered": ("covered", "TEST CI FOUND"),
+            "missing": ("gap", "NO TEST RUNNER FOUND"),
+            "unknown": ("unknown", "MATRIX NOT ANALYZED"),
+        }
+        status_class, status_label = coverage_labels[coverage_status]
+        job_names = [f"{job['workflow']} · {job['job']}" for job in row["test_jobs"]]
+        job_names.extend(row.get("unknown_test_jobs", []))
         platform_cards.append(
             '<article class="platform"><div class="platform-name">{name}</div><div class="status {status}">{status_label}</div>'
             "<p>{jobs}</p><small>{skips} platform-related skip marker(s)</small></article>".format(
                 name=html.escape(row["platform"]),
-                status="covered" if row["test_ci_present"] else "gap",
-                status_label="TEST CI FOUND"
-                if row["test_ci_present"]
-                else "NO TEST RUNNER FOUND",
+                status=status_class,
+                status_label=status_label,
                 jobs=html.escape(
-                    ", ".join(
-                        f"{job['workflow']} · {job['job']}" for job in row["test_jobs"]
-                    )
-                    or "No explicit test job detected"
+                    ", ".join(job_names) or "No explicit test job detected"
                 ),
                 skips=row["platform_skip_count"],
             )
@@ -1647,7 +1766,7 @@ def render_html(report: dict) -> str:
 *{{box-sizing:border-box}}body{{margin:0;background:var(--paper);color:var(--ink);font-family:var(--sans);line-height:1.5}}.layout{{max-width:1320px;margin:auto;padding:34px clamp(18px,4vw,58px) 60px}}
 header{{display:flex;justify-content:space-between;align-items:center;border-top:5px solid var(--sea);padding:13px 0 22px;border-bottom:1px solid var(--line)}}.brand{{font:700 12px var(--mono);letter-spacing:.15em;text-transform:uppercase}}.brand b{{display:inline-block;background:var(--sea);color:white;padding:3px 7px;margin-right:9px;letter-spacing:.04em}}.scope{{font:11px var(--mono);color:var(--muted);text-align:right}}
 .intro{{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(220px,.65fr);align-items:end;gap:24px;padding:36px 0 30px}}.kicker{{font:11px var(--mono);color:var(--sea-dark);letter-spacing:.12em;text-transform:uppercase}}h1{{font-size:clamp(39px,6vw,74px);line-height:.96;letter-spacing:-.06em;margin:12px 0 14px;max-width:800px}}.intro p{{max-width:690px;color:var(--muted);margin:0}}.score{{border-left:1px solid var(--line);padding:9px 0 9px 22px}}.score strong{{display:block;font:500 clamp(42px,7vw,75px) var(--mono);letter-spacing:-.08em;color:var(--sea-dark)}}.score span{{font:11px var(--mono);color:var(--muted);text-transform:uppercase;letter-spacing:.08em}}
-.section-bar{{display:flex;justify-content:space-between;align-items:baseline;gap:15px;margin:17px 0 11px}}h2{{font-size:17px;letter-spacing:-.02em;margin:0}}.section-bar p{{font:11px var(--mono);color:var(--muted);margin:0}}.grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}}.platform{{padding:17px 18px;background:var(--panel);border:1px solid var(--line);min-height:150px;position:relative}}.platform:before{{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--sea)}}.platform:has(.status.gap):before{{background:var(--orange)}}.platform-name{{font:600 22px var(--mono);text-transform:uppercase}}.status{{display:inline-block;font:10px var(--mono);letter-spacing:.08em;margin:8px 0 5px;padding:3px 6px;background:#cde8e1;color:#085a55}}.status.gap{{background:#f3d4c9;color:#883c24}}.platform p{{font-size:12px;color:var(--muted);margin:0 0 8px;overflow-wrap:anywhere}}.platform small{{font:10px var(--mono);color:var(--muted)}}.empty-card{{grid-column:1/-1;padding:22px;border:1px dashed var(--line);color:var(--muted)}}
+.section-bar{{display:flex;justify-content:space-between;align-items:baseline;gap:15px;margin:17px 0 11px}}h2{{font-size:17px;letter-spacing:-.02em;margin:0}}.section-bar p{{font:11px var(--mono);color:var(--muted);margin:0}}.grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}}.platform{{padding:17px 18px;background:var(--panel);border:1px solid var(--line);min-height:150px;position:relative}}.platform:before{{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--sea)}}.platform:has(.status.gap):before{{background:var(--orange)}}.platform:has(.status.unknown):before{{background:#b98d28}}.platform-name{{font:600 22px var(--mono);text-transform:uppercase}}.status{{display:inline-block;font:10px var(--mono);letter-spacing:.08em;margin:8px 0 5px;padding:3px 6px;background:#cde8e1;color:#085a55}}.status.gap{{background:#f3d4c9;color:#883c24}}.status.unknown{{background:#f3e8c5;color:#705512}}.platform p{{font-size:12px;color:var(--muted);margin:0 0 8px;overflow-wrap:anywhere}}.platform small{{font:10px var(--mono);color:var(--muted)}}.empty-card{{grid-column:1/-1;padding:22px;border:1px dashed var(--line);color:var(--muted)}}
 .findings{{margin-top:35px}}.toolbar{{display:flex;justify-content:space-between;align-items:end;gap:14px;margin:14px 0}}label{{font-size:11px;color:var(--muted)}}input{{display:block;margin-top:6px;padding:9px 10px;background:var(--panel);border:1px solid var(--line);min-width:min(300px,70vw);font:inherit;color:var(--ink)}}input:focus-visible{{outline:3px solid var(--sea);outline-offset:2px}}.counter{{font:11px var(--mono);color:var(--muted)}}.table-box{{overflow:auto;border:1px solid var(--line);background:var(--panel)}}table{{border-collapse:collapse;width:100%;min-width:950px;text-align:left}}th{{padding:11px 13px;background:var(--night);color:#d7e9e2;font:10px var(--mono);letter-spacing:.1em;text-transform:uppercase}}td{{padding:13px;border-bottom:1px solid var(--line);vertical-align:top;font-size:12px}}td p{{margin:5px 0;color:var(--ink)}}td small{{color:var(--muted);display:block;max-width:430px}}td code{{font:11px var(--mono);overflow-wrap:anywhere}}.severity{{font:10px var(--mono);text-transform:uppercase;padding:3px 6px;background:#e8ede7}}.severity.warning{{background:#f2d8c8;color:#8b3d20}}.severity.review{{background:#f3e5bf;color:#765818}}.severity.note{{background:#d2e7e5;color:#155b59}}.empty{{text-align:center;padding:34px;color:var(--muted)}}
 .limits{{margin-top:34px;background:#e2e9e2;padding:18px 22px;border-left:4px solid var(--gold)}}.limits h2{{margin-bottom:9px}}.limits ul{{margin:0;padding-left:18px;color:var(--muted);font-size:12px}}.limits li+li{{margin-top:4px}}footer{{margin-top:28px;padding-top:11px;border-top:1px solid var(--line);display:flex;justify-content:space-between;gap:14px;color:var(--muted);font:10px var(--mono)}}
 @media(max-width:760px){{.intro{{grid-template-columns:1fr;align-items:start;padding:27px 0}}.score{{border-left:0;border-top:1px solid var(--line);padding:12px 0 0}}.score strong{{font-size:52px}}.grid{{grid-template-columns:1fr}}.toolbar{{align-items:start;flex-direction:column}}input{{width:100%}}footer{{flex-direction:column}}header{{align-items:start;gap:12px;flex-direction:column}}.scope{{text-align:left}}}}

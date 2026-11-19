@@ -245,6 +245,116 @@ jobs:
         report = scan_project(self.root, supported_override=["linux", "windows"])
         self.assertEqual(report["summary"]["test_ci_platforms"], ["linux", "windows"])
 
+    def test_oversized_matrix_marks_coverage_unknown_instead_of_missing(self) -> None:
+        self.write(
+            "pyproject.toml",
+            """
+[project]
+name = "fixture"
+classifiers = [
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+]
+""",
+        )
+        versions = ", ".join(f'"{index}"' for index in range(86))
+        self.write(
+            ".github/workflows/tests.yml",
+            f"""
+jobs:
+  tests:
+    runs-on: ${{{{ matrix.os }}}}
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+        python: [{versions}]
+    steps:
+      - run: python -m unittest
+""",
+        )
+
+        report = scan_project(self.root)
+        rows = {row["platform"]: row for row in report["platforms"]}
+        self.assertEqual(
+            {platform: row["test_ci_status"] for platform, row in rows.items()},
+            {"windows": "unknown", "linux": "unknown", "macos": "unknown"},
+        )
+        self.assertTrue(report["summary"]["test_ci_unknown"])
+        rule_ids = {item["rule_id"] for item in report["findings"]}
+        self.assertIn("CG906", rule_ids)
+        self.assertNotIn("CG901", rule_ids)
+        self.assertIn("MATRIX NOT ANALYZED", render_html(report))
+        from crossgrid.cli import _text
+
+        text_report = _text(report)
+        self.assertIn("coverage unknown; matrix not analyzed", text_report)
+        self.assertNotIn("no test runner found", text_report)
+
+        from crossgrid.cli import run
+
+        json_path = self.root / "matrix-report.json"
+        cli_output = StringIO()
+        with redirect_stdout(cli_output):
+            self.assertEqual(
+                run(
+                    Namespace(
+                        root=str(self.root),
+                        platform=None,
+                        html=None,
+                        json_path=str(json_path),
+                        sarif=None,
+                        fail_on="none",
+                        overwrite=False,
+                    )
+                ),
+                0,
+            )
+        json_report = json.loads(json_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            {row["test_ci_status"] for row in json_report["platforms"]}, {"unknown"}
+        )
+        json_rule_ids = {item["rule_id"] for item in json_report["findings"]}
+        self.assertIn("CG906", json_rule_ids)
+        self.assertNotIn("CG901", json_rule_ids)
+        self.assertIn("coverage unknown; matrix not analyzed", cli_output.getvalue())
+
+    def test_unrecognized_matrix_runner_labels_remain_unknown(self) -> None:
+        self.write(
+            "pyproject.toml",
+            """
+[project]
+name = "fixture"
+classifiers = [
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+]
+""",
+        )
+        self.write(
+            ".github/workflows/tests.yml",
+            """
+jobs:
+  tests:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [self-hosted, custom-runner]
+    steps:
+      - run: python -m unittest
+""",
+        )
+
+        report = scan_project(self.root)
+        self.assertTrue(report["summary"]["test_ci_unknown"])
+        self.assertEqual(
+            {row["test_ci_status"] for row in report["platforms"]}, {"unknown"}
+        )
+        rule_ids = {item["rule_id"] for item in report["findings"]}
+        self.assertIn("CG906", rule_ids)
+        self.assertNotIn("CG901", rule_ids)
+
     def test_derived_matrix_expression_is_left_unclassified(self) -> None:
         self.write(
             ".github/workflows/tests.yml",
@@ -845,6 +955,98 @@ except ImportError:
             code = run(args)
         self.assertEqual(code, 2)
         self.assertFalse(report.exists())
+
+    def test_cli_requires_explicit_overwrite_without_bypassing_input_guard(
+        self,
+    ) -> None:
+        from crossgrid.cli import run
+
+        metadata = self.root / "pyproject.toml"
+        original_metadata = '[project]\nname="fixture"\n'
+        self.write("pyproject.toml", original_metadata)
+        self.write("src/app.py", "def main():\n    return None\n")
+        report = self.root / "report.json"
+        report.write_text("preserve this file", encoding="utf-8")
+        args = Namespace(
+            root=str(self.root),
+            platform=None,
+            html=None,
+            json_path=str(report),
+            sarif=None,
+            fail_on="error",
+            overwrite=False,
+        )
+
+        errors = StringIO()
+        with redirect_stderr(errors):
+            self.assertEqual(run(args), 2)
+        self.assertIn("already exists", errors.getvalue())
+        self.assertEqual(report.read_text(encoding="utf-8"), "preserve this file")
+
+        args.overwrite = True
+        with redirect_stderr(StringIO()):
+            self.assertEqual(run(args), 0)
+        self.assertEqual(
+            json.loads(report.read_text(encoding="utf-8"))["tool"], "CrossGrid"
+        )
+
+        args.json_path = str(metadata)
+        errors = StringIO()
+        with redirect_stderr(errors):
+            self.assertEqual(run(args), 2)
+        self.assertIn("scan input", errors.getvalue())
+        self.assertEqual(metadata.read_text(encoding="utf-8"), original_metadata)
+
+    def test_report_write_does_not_clobber_a_file_created_during_write(self) -> None:
+        from crossgrid.scanner import _write_report
+
+        destination = self.root / "concurrent-report.json"
+
+        def concurrent_create(_temporary: str, target: str) -> None:
+            Path(target).write_text("concurrent writer", encoding="utf-8")
+            raise FileExistsError("created concurrently")
+
+        with (
+            patch("crossgrid.scanner.os.link", side_effect=concurrent_create),
+            self.assertRaisesRegex(ValueError, "already exists.*--overwrite"),
+        ):
+            _write_report(destination, '{"new": true}\n')
+
+        self.assertEqual(destination.read_text(encoding="utf-8"), "concurrent writer")
+
+    def test_report_write_uses_exclusive_fallback_without_hard_links(self) -> None:
+        from crossgrid.scanner import _write_report
+
+        destination = self.root / "exclusive-report.json"
+        with patch("crossgrid.scanner.os.link", side_effect=OSError("unsupported")):
+            _write_report(destination, '{"fallback": true}\n')
+        self.assertEqual(
+            json.loads(destination.read_text(encoding="utf-8")), {"fallback": True}
+        )
+
+    def test_report_fallback_preserves_a_target_created_after_preflight(self) -> None:
+        from crossgrid.scanner import _write_report
+
+        destination = self.root / "fallback-race.json"
+
+        def publish_existing_report_then_disable_links(
+            _temporary: str, target: str
+        ) -> None:
+            Path(target).write_text("report path already claimed", encoding="utf-8")
+            raise OSError("hard links unavailable")
+
+        with (
+            patch(
+                "crossgrid.scanner.os.link",
+                side_effect=publish_existing_report_then_disable_links,
+            ),
+            self.assertRaisesRegex(ValueError, "already exists.*--overwrite"),
+        ):
+            _write_report(destination, '{"new": true}\n')
+
+        self.assertEqual(
+            destination.read_text(encoding="utf-8"), "report path already claimed"
+        )
 
     def test_cli_rejects_git_metadata_and_linked_worktree_outputs(self) -> None:
         from crossgrid.cli import run

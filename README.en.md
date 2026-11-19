@@ -6,7 +6,7 @@ CrossGrid connects four kinds of evidence in a Python repository: operating syst
 
 CrossGrid is static analysis. It does not execute your project on Windows, Linux or macOS, and a clean report is not proof of portability.
 
-Local verification used Windows: all 40 tests in the current source tree passed on Python 3.11.0. GitHub Actions runs [#2](https://github.com/furuilon/crossgrid/actions/runs/44207813048) and [#3](https://github.com/furuilon/crossgrid/actions/runs/44211496002) passed all 12 Ubuntu/macOS/Windows × Python 3.11–3.14 combinations on commits `ece8383cf04e734c93051dd247830f3fdb81c2d8` and `0b24739f790a99c5efa722a3260524628044854f`, respectively. Each job completed package installation, CLI smoke checks, `pip check`, and all 40 automated tests, including regression tests that simulate Windows junction/reparse-point metadata. See the [Actions page](https://github.com/furuilon/crossgrid/actions/workflows/tests.yml) for later commits. Earlier run [#1](https://github.com/furuilon/crossgrid/actions/runs/44198425891) also passed on commit `33717f6b328325e343469723242a033787c7b483`. A standalone sdist build and inspection remain unverified, and the project is not published to PyPI. Passing the automated test suite does not establish scanner accuracy on every real repository, and the report has not been visually inspected in a browser.
+The hosted workflow runs Python 3.11–3.14 tests on Windows, macOS and Ubuntu. Check the [Actions page](https://github.com/furuilon/crossgrid/actions/workflows/tests.yml) for results associated with a specific commit. The current sdist has not been independently inspected, and the project is not published to PyPI. Automated tests do not establish scanner accuracy on every real repository; generated reports have not been reviewed in a browser viewport.
 
 简体中文主页：[README.md](README.md) · [架构](ARCHITECTURE.md) · [项目规格](PROJECT_SPEC.md) · [技术机制](TECHNICAL_INNOVATION.md)
 
@@ -40,6 +40,8 @@ crossgrid . --platform windows --platform linux
 
 The report shows declared targets and test-like `runs-on` evidence separately. It also lists simple `pytest.mark.skipif` platform conditions and source locations.
 
+Existing report paths are refused by default. Add `--overwrite` only after checking the destination; it never bypasses scan-input, duplicate-path or Git-metadata guards.
+
 ## Current rules
 
 | Rule | Signal |
@@ -52,6 +54,7 @@ The report shows declared targets and test-like `runs-on` evidence separately. I
 | CG801 | A simple platform-related `skipif`/`skipUnless` marker |
 | CG901 | Declared target OS has no recognized explicit test-like Actions runner |
 | CG902–905 | Workflow, metadata or source file could not be analyzed |
+| CG906 | Runner matrix exceeds the analysis scope or contains OS labels that cannot be mapped; affected coverage is unknown rather than a confirmed missing runner |
 
 The rules are conservative and incomplete. Every finding includes confidence, source location and the evidence used.
 
@@ -67,16 +70,17 @@ The Python official standard-library pages below document platform restrictions 
 
 - Python source files; hidden and common generated/dependency directories are skipped.
 - Symlinked source, metadata and workflow paths are not followed; resolved inputs must stay inside the selected project root.
+- CrossGrid is not a security sandbox and assumes that another process does not replace project files during a scan. A race can occur between path checks and file reads or writes.
 - `pyproject.toml` OS classifiers, including common Poetry metadata.
 - `.github/workflows/*.yml` and `.yaml` with explicit `runs-on`, or scalar `strategy.matrix.os`/`include[].os` values referenced directly by `runs-on`.
 - Simple pytest/unittest platform skip markers that contain recognizable OS names.
 - Bounded inputs: each Python file up to 8 MiB, 128 MiB total Python source and 20,000 Python files; each workflow up to 2 MiB, 32 MiB total workflow data and 1,000 workflow files; `pyproject.toml` up to 1 MiB. Oversized inputs produce CG90x findings instead of unbounded reads.
-- Selected reports are written by atomic replacement. Output targets must be distinct and cannot point to scan inputs, symbolic links, Windows junction/reparse-point paths, or Git administrative metadata. Existing report files may be replaced safely.
+- Output targets must be distinct and cannot overwrite scan inputs, symbolic links, Windows junction/reparse-point paths, or Git administrative metadata. Existing files are refused unless `--overwrite` is supplied after review. New files are created without clobbering; replacement uses a same-directory temporary file and atomic replace. If the filesystem does not support hard links, exclusive creation plus copying is used; an interrupted or failed copy may leave a partial new report but will not replace an existing target.
 
 ### Workflow and runner scope
 
 - Derived or complex YAML expressions, reusable workflow inheritance, GitLab/CircleCI, custom marker evaluation, third-party dependency wheel support, and actual execution on other operating systems are outside the current scope.
-- Matrix runners are counted only when `runs-on` directly uses `${{ matrix.os }}` or `${{ matrix['os'] }}`; scalar `exclude` and `include` are applied. Matrices with more than 256 combinations or non-scalar dimensions are not analyzed.
+- Matrix runners are counted only when `runs-on` directly uses `${{ matrix.os }}` or `${{ matrix['os'] }}`; scalar `exclude` and `include` are applied. Matrices with more than 256 combinations, non-scalar dimensions, or OS labels that cannot be mapped produce `CG906` and unknown coverage for affected OS targets, not a `CG901` missing-runner conclusion.
 - Test jobs are inferred from whole-word job/step labels or recognized direct invocations such as `python -m`, `py -3.x -m`, `env VAR=value`, simple `coverage run -m`, and `uv`/`poetry`/`pipenv run`. `tox`/`nox` count only when an explicitly selected environment or session name contains a `test`/`unit` marker.
 - Opaque default `tox`/`nox` runs, list/config inspection (including `tox config -e ...`), lint-only selections, `tox --notest`/package-only, devenv, help/version, pytest collection-only, install, echo, and mere mentions of test tools do not count. Command-text heuristics suggest that tests may run; they do not prove that tests ran or passed.
 - Generic POSIX/Unix classifiers are not treated as Linux or macOS support declarations.

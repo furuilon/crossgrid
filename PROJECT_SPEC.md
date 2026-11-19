@@ -14,21 +14,19 @@
 - **Core mechanism:** Parse Python source using `ast`, read TOML platform classifiers and YAML workflows, normalize explicit OS labels, and associate evidence without executing project code.
 - **Stack:** Python 3.11+ and PyYAML 6.x.
 - **Data:** In-memory findings contain rule ID, severity, confidence, relative path, line/column, subject, message, and evidence. JSON is the primary structured report.
-- **Safety boundary:** It does not execute code, tests, workflow commands, plugins, or package installation, and it does not overwrite scanned inputs. Symlinked and out-of-root Python, metadata, and workflow paths are skipped before reads. Selected report outputs use atomic replacement and reject input aliases, symlink/junction/reparse-point paths and Git metadata. Input sizes/file counts are bounded. It is not a handle-based sandbox against concurrent file replacement.
+- **Safety boundary:** It does not execute code, tests, workflow commands, plugins, or package installation, and it does not overwrite scanned inputs. Symlinked and out-of-root Python, metadata, and workflow paths are skipped before reads. Report outputs reject input aliases, duplicate targets, symlink/junction/reparse-point paths and Git metadata. Existing files are refused unless `--overwrite` is explicit. New reports use no-clobber creation; overwrite uses a same-directory temporary file and atomic replacement of the requested destination path. If hard links are unavailable, exclusive-create copying can leave a partial new report if interrupted or if copying fails. Input sizes/file counts are bounded. It is not a handle-based sandbox against concurrent replacement of scanned inputs or output paths; the scanner assumes a stable project tree.
 - **MVP output:** Text plus optional JSON, SARIF 2.1.0, and self-contained searchable HTML.
 - **Non-goals:** Proving portability; supporting every CI provider or GitHub expression; evaluating arbitrary skip expressions; reproducing a complete platform-specific API database; modifying source or workflows.
 
-## Validation and completion criteria
+## Test coverage and verification status
 
-- Test OS classifiers, explicit matrix runners, runner/name heuristics, skip conditions, and missing-coverage signals.
-- Exercise AST findings for platform imports/APIs, signal constants, encoding, temporary files, and shell calls, including guarded/review cases.
-- Test empty projects, malformed Python/TOML/YAML, report escaping, SARIF source locations, CLI output files, and fail thresholds.
-- GitHub Actions runs [#2](https://github.com/furuilon/crossgrid/actions/runs/44207813048) and [#3](https://github.com/furuilon/crossgrid/actions/runs/44211496002) passed all 12 Windows/Ubuntu/macOS × Python 3.11–3.14 jobs on commits `ece8383cf04e734c93051dd247830f3fdb81c2d8` and `0b24739f790a99c5efa722a3260524628044854f`, respectively. Each job installed the current project, passed CLI and `pip check` steps, and ran all 40 tests, including regression tests that simulate Windows junction/reparse-point metadata. See the [Actions page](https://github.com/furuilon/crossgrid/actions/workflows/tests.yml) for later commits. The matrix is actual hosted evidence; a separately built and inspected sdist is still unverified.
-- The current source tree also passed 40 tests on Windows/Python 3.11.0. Earlier local wheel/sdist inspection covered a 38-test snapshot; the hosted `pip install .` jobs exercised package builds/install across the current matrix but did not produce or inspect a release sdist. The project is not published to PyPI. Automated tests do not establish the scanner's accuracy on every real repository, and the generated report has not been visually inspected in a browser.
+- The suite covers declared OS classifiers, explicit workflow runners, simple matrix extraction, platform skip markers, bounded source rules, malformed inputs, report escaping, SARIF locations, CLI paths, and exit thresholds. Regression cases verify that oversized, unsupported, or unrecognized runner matrices remain **unknown** instead of becoming false missing-runner claims, and that existing or concurrently created output files are not silently replaced.
+- The hosted workflow tests Python 3.11–3.14 on Windows, macOS and Ubuntu. See the [Actions page](https://github.com/furuilon/crossgrid/actions/workflows/tests.yml) for results associated with each commit. The standalone current sdist has not been independently inspected, and the project is not published to PyPI.
+- Automated fixtures do not establish scanner accuracy on every real repository. Generated reports have not been visually inspected in a browser; actual repository accuracy and user acceptance remain outside these automated checks.
 
 ## Risks
 
-Test-job detection and OS label normalization are heuristic. Nearby guards are not control-flow proof. Static rules can miss dynamic behavior and create false positives. Only explicit GitHub Actions runners are understood.
+Test-job detection and OS label normalization are heuristic. Nearby guards are not control-flow proof. Static rules can miss dynamic behavior and create false positives. Only explicit GitHub Actions runners are understood. Matrices above the documented analysis bound, with unsupported values, or with unrecognized OS labels are reported as unknown rather than treated as full coverage or confirmed gaps.
 
 ## Maintenance
 

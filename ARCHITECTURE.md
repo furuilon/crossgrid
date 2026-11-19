@@ -13,7 +13,7 @@ pytest skip markers ─────────────┘
 
 The scanner walks Python source outside common hidden, generated and dependency directories. It builds AST nodes and source locations, then reports a limited set of platform-specific imports/APIs, implicit text encoding, temporary-file review signals and shell invocation. Python and workflow reads have per-file and aggregate byte limits plus file-count limits; TOML and Git marker files are also bounded.
 
-The workflow reader only counts an OS as a test runner when the job name or its step text appears test-related and an explicit runner label can be normalized. It recognizes `windows`, `ubuntu/linux`, and `macos` label families. The project scope comes from common OS classifiers or `--platform`; if neither exists, the report says support is undeclared and does not imply all OSes are supported.
+The workflow reader only counts an OS as a test runner when the job name or its step text appears test-related and an explicit runner label can be normalized. It recognizes `windows`, `ubuntu/linux`, and `macos` label families. Scalar OS matrices are expanded only when the runner directly references `matrix.os`; combinations are capped at 256. An over-limit, unsupported, or unrecognized-OS matrix emits `CG906` and leaves affected coverage unknown, so an incomplete parse does not become a missing-runner claim. The project scope comes from common OS classifiers or `--platform`; if neither exists, the report says support is undeclared and does not imply all OSes are supported.
 
 ## Confidence model
 
@@ -34,12 +34,12 @@ Confidence describes the static signal, not whether the code is broken. A nearby
 ## Modules and interfaces
 
 - `src/crossgrid/scanner.py` owns discovery, parsing, normalization, rule evaluation and report rendering. `scan_project(root, supported_override=None) -> dict` is the public scan operation; `report_exit_code(report, fail_on) -> int` applies the configured gate.
-- `src/crossgrid/cli.py` defines `build_parser()`, `run(namespace) -> int`, and `main()`. Report outputs are checked together before writing: input aliases, duplicate targets, symlinked or Windows junction/reparse-point paths, and Git administrative metadata are rejected. Each output uses a same-directory temporary file followed by atomic replacement; expected filesystem/scan errors return exit code 2.
+- `src/crossgrid/cli.py` defines `build_parser()`, `run(namespace) -> int`, and `main()`. Report outputs are checked together before writing: input aliases, duplicate targets, existing targets without `--overwrite`, symlinked or Windows junction/reparse-point paths, and Git administrative metadata are rejected. New outputs use no-clobber creation; explicit overwrite uses a same-directory temporary file followed by atomic replacement of the requested destination path. If hard links are unavailable, exclusive-create copying may leave a partial new report if interrupted or if copying fails. Expected filesystem/scan errors return exit code 2.
 - `src/crossgrid/__init__.py` owns the package version. `tests/test_scanner.py` covers AST, TOML/YAML fixtures, path-boundary behavior, reports, CLI output, and failure thresholds.
 
 ## Filesystem and error boundary
 
-The selected root is resolved once. Python sources, `pyproject.toml`, workflow directories, and workflow files are checked to remain inside the root and are not followed through symlinks. Unsafe source/workflow paths become CG904/CG903 findings; unsafe metadata becomes CG902. Parse/read failures are reported by input type instead of aborting the entire scan when safe to continue. The scanner does not execute scanned code or workflow commands.
+The selected root is resolved once. Python sources, `pyproject.toml`, workflow directories, and workflow files are checked to remain inside the root and are not followed through symlinks. Unsafe source/workflow paths become CG904/CG903 findings; unsafe metadata becomes CG902. Parse/read failures are reported by input type instead of aborting the entire scan when safe to continue. The scanner does not execute scanned code or workflow commands. Output targets refuse existing files by default; `--overwrite` is required to replace one and never bypasses scan-input or Git metadata checks.
 
 Containment is checked before each read and write, but this is not a handle-based sandbox: a process that can replace files concurrently could race the check (TOCTOU). CrossGrid assumes a stable local tree during scanning.
 

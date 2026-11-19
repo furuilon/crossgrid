@@ -6,7 +6,7 @@ CrossGrid 将 Python 仓库里的四类证据放在一起查看：`pyproject.tom
 
 CrossGrid 做静态分析，不会替你在 Windows、Linux 或 macOS 上运行项目。没有发现问题也不等于已证明可移植。
 
-本机验证环境为 Windows：当前源码树的 40 项测试在 Python 3.11.0 全部通过。GitHub Actions run [#2](https://github.com/furuilon/crossgrid/actions/runs/44207813048) 在提交 `ece8383cf04e734c93051dd247830f3fdb81c2d8` 上通过 12/12 组合；run [#3](https://github.com/furuilon/crossgrid/actions/runs/44211496002) 也在提交 `0b24739f790a99c5efa722a3260524628044854f` 上通过 12/12 组合。两次均覆盖 Ubuntu/macOS/Windows × Python 3.11–3.14；每个任务完成包安装、CLI 冒烟、`pip check` 和 40 项测试，包含模拟 Windows junction/reparse 元数据的回归用例。请查看 [Actions 页面](https://github.com/furuilon/crossgrid/actions/workflows/tests.yml)了解后续提交状态。更早的 run [#1](https://github.com/furuilon/crossgrid/actions/runs/44198425891) 也在提交 `33717f6b328325e343469723242a033787c7b483` 上通过。独立的 sdist 构建/检查仍未完成；项目尚未发布到 PyPI。自动化测试通过不代表扫描结果已在各种真实仓库中验证，也不代表报告页面已在浏览器中检查。
+托管工作流会在 Windows、macOS、Ubuntu 上运行 Python 3.11–3.14 测试。请查看 [Actions 页面](https://github.com/furuilon/crossgrid/actions/workflows/tests.yml)核对具体提交的结果。当前独立 sdist 内容尚未单独检查，项目尚未发布到 PyPI。自动化测试不能证明扫描器对每个真实仓库都准确；生成报告也尚未经过浏览器视口检查。
 
 English version：[README.en.md](README.en.md) · [项目规格](PROJECT_SPEC.md) · [技术机制](TECHNICAL_INNOVATION.md) · [架构](ARCHITECTURE.md)
 
@@ -40,6 +40,8 @@ crossgrid . --platform windows --platform linux
 
 报告会分别显示项目声明和测试 runner 证据，并列出简单的 `pytest.mark.skipif` 平台条件与源码位置。
 
+默认拒绝替换已有报告文件。只有检查过目标内容后才加 `--overwrite`；该选项不会绕过扫描输入、重复路径或 Git 元数据保护。
+
 ## 现有规则
 
 - `CG101`：检测少量平台专属模块，如 `pwd`、`fcntl`、`resource`、`termios`、`winreg`。
@@ -50,6 +52,7 @@ crossgrid . --platform windows --platform linux
 - `CG801`：识别简单的平台相关 `skipif`/`skipUnless` 标记。
 - `CG901`：声明支持的 OS 没有发现明确的 Actions 测试 runner。
 - `CG902–905`：workflow、metadata 或源码无法分析。
+- `CG906`：runner matrix 超出分析范围或包含无法映射的 OS 标签；相关平台覆盖标为未知，不作为 `CG901` 缺少 runner 的证据。
 
 规则有限且不完整。每条报告都会带有置信度、源码位置和判断依据。
 
@@ -64,18 +67,19 @@ crossgrid . --platform windows --platform linux
 ## 输入与限制
 
 符号链接的源码、元数据和 workflow 路径不会被跟随；解析后的输入必须仍位于所选项目根目录内。
+CrossGrid 不是安全沙箱；它假设扫描期间没有其他进程并发替换项目文件。路径检查与文件读取/写入之间仍存在竞态窗口。
 
 - 扫描 Python 源码；跳过常见隐藏目录、生成目录和依赖目录。
 - 解析 `pyproject.toml` 的 OS classifiers，包含常见 Poetry metadata。
 - 读取 `.github/workflows/*.yml` 与 `.yaml` 中显式写出的 `runs-on`，以及被 `runs-on` 直接引用的标量 `strategy.matrix.os`/`include[].os`。
 - 识别包含常见系统名称的简单 pytest/unittest 跳过标记。
 - 输入有界：单个 Python 文件最多 8 MiB、Python 总输入最多 128 MiB、最多 20,000 个 Python 文件；单个 workflow 最多 2 MiB、workflow 总输入最多 32 MiB、最多 1,000 个 workflow；`pyproject.toml` 最多 1 MiB。超限文件会以 CG90x finding 说明，避免无界读取。
-- 指定报告会以临时文件原子替换写入；目标必须互不相同，不可指向扫描输入、符号链接或 Windows junction/reparse-point 路径，或 Git 管理目录。已有报告文件可以安全替换。
+- 指定报告目标必须互不相同，且不能覆盖扫描输入、符号链接或 Windows junction/reparse-point 路径，或 Git 管理目录。默认拒绝已有文件；只有确认目标后才使用 `--overwrite`。新文件以不覆盖方式创建；替换现有文件时使用同目录临时文件和原子替换。若文件系统不支持硬链接，会使用独占创建后复制；复制被中断或失败时可能留下不完整的新报告，但不会替换已有目标。
 
 ### Workflow 与 runner 范围
 
 - 不解析复杂或派生 YAML 表达式、可复用 workflow 的继承、GitLab/CircleCI、自定义 marker 求值、第三方依赖 wheel 兼容性，也不会在其他 OS 上实际运行项目。
-- 只有 `runs-on` 直接使用 `${{ matrix.os }}` 或 `${{ matrix['os'] }}` 时才计算 matrix runner；支持标量 `exclude`/`include`。超过 256 种组合或含非标量维度的 matrix 不在范围内。
+- 只有 `runs-on` 直接使用 `${{ matrix.os }}` 或 `${{ matrix['os'] }}` 时才计算 matrix runner；支持标量 `exclude`/`include`。超过 256 种组合、含非标量维度或无法映射 OS 标签的 matrix 会产生 `CG906`，并将相关平台标为“未知”；不会把分析器上限或未知 runner 误报成确定的缺少 runner (`CG901`)。
 - 测试任务的判断依赖完整单词 job/step 名称，或可识别的直接测试命令，例如 `python -m`、`py -3.x -m`、`env VAR=value`、简单的 `coverage run -m`、`uv`/`poetry`/`pipenv run`。`tox`/`nox` 只有在显式选择的环境或 session 名称带有 `test`/`unit` 标记时才计入。
 - 无法解析的默认 `tox`/`nox`、list/config 检查（包括 `tox config -e ...`）、仅 lint、`tox --notest`/仅打包、devenv、help/version、pytest 仅收集、安装、echo 和仅提及测试工具都不计入。命令文本只能提示可能执行了测试，不能证明执行或通过。
 - 通用 POSIX/Unix classifier 不会自动推断成 Linux 或 macOS 支持声明。
